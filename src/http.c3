@@ -41,17 +41,17 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
     // Parse the status line + headers.
     parser::Header[MAX_RESPONSE_HEADERS] hstore;
     parser::ResponseHead presp;
-    int rc = parser::parse_response(raw, &presp, hstore[..], 0);
-    if (rc < 0) return MALFORMED_RESPONSE~;
+    usz? consumed = parser::parse_response(raw, &presp, hstore[..], 0);
+    if (catch consumed) return MALFORMED_RESPONSE~;
 
     // Frame the body: chunked, Content-Length, or read-to-EOF.
-    char[] rest = raw[(usz)rc..];
+    char[] rest = raw[consumed..];
     char[] body;
     if (ci_eq(find_header(presp.headers, "Transfer-Encoding"), "chunked"))
     {
         parser::ChunkedDecoder dec = { .consume_trailer = true };
         usz bsz = rest.len;
-        if (parser::decode_chunked(&dec, rest, &bsz) < 0) return MALFORMED_RESPONSE~;
+        if (catch parser::decode_chunked(&dec, rest, &bsz)) return MALFORMED_RESPONSE~;
         body = rest[:bsz];
     }
     else

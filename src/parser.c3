@@ -1,43 +1,28 @@
-// A C3 port of picohttpparser by Kazuho Oku et al.
+// An idiomatic C3 reimplementation of h2o/picohttpparser's HTTP/1.x parsing.
 // Upstream: https://github.com/h2o/picohttpparser
 //
 // Copyright (c) 2009-2014 Kazuho Oku, Tokuhiro Matsuno, Daisuke Murase,
 //                         Shigeo Mitsunari
 //
 // The original software is licensed under either the MIT License or the Perl
-// license. This port preserves that notice.
+// license. This reimplementation preserves that notice.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to
-// deal in the Software without restriction, including without limitation the
-// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-// sell copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-//
-// Notes on the port:
-//   * `char` is unsigned 8-bit in C3, so the original `(unsigned char)` casts
-//     are unnecessary.
-//   * The SSE4.2 `findchar_fast` fast paths are omitted; the portable scalar
-//     loops (the `#else` branches of the original) are ported verbatim. This
-//     keeps the parser correct across every target in the manifest.
-//   * Tokens are returned as `char[]` slices into the caller's buffer rather
-//     than as (pointer, length) pairs.
+// This is NOT a line-by-line port: it walks the input with a slice-based
+// `Reader` cursor and signals progress with optionals (`!` propagates the
+// INCOMPLETE / MALFORMED faults). Observable behaviour — including the obs-fold
+// leading-whitespace quirk and the slowloris completeness check — matches the
+// original. `char` is unsigned 8-bit in C3, so the original `(unsigned char)`
+// casts are unnecessary.
 
 module tinyhttp::parser;
 
-// Returned by the parse_* functions in place of a byte count.
-const int PARTIAL = -2; // input is incomplete; call again with more data
-const int INVALID = -1; // input is malformed
+<* Faults thrown by the parse_* functions:
+   - INCOMPLETE: the input is a valid prefix; call again with more bytes.
+   - MALFORMED:  the input is invalid. *>
+faultdef INCOMPLETE, MALFORMED;
 
-<* A single HTTP header.
-
-   `name` has length 0 when the line is a continuation (obs-fold) of the
-   previous header's value. *>
+<* A single HTTP header. `name` has length 0 when the line is an obs-fold
+   continuation of the previous header's value. *>
 struct Header
 {
     char[] name;
@@ -50,7 +35,7 @@ struct RequestHead
     char[]   method;
     char[]   path;
     int      minor_version;
-    Header[] headers; // sub-slice of the caller-provided header buffer that was filled
+    Header[] headers;   // sub-slice of the caller's header buffer that was filled
 }
 
 // Populated by `parse_response` on success.
@@ -59,10 +44,10 @@ struct ResponseHead
     int      minor_version;
     int      status;
     char[]   msg;
-    Header[] headers; // sub-slice of the caller-provided header buffer that was filled
+    Header[] headers;   // sub-slice of the caller's header buffer that was filled
 }
 
-// RFC 7230 token characters ("tchar"). Mirrors the original `token_char_map`.
+// RFC 7230 token characters ("tchar").
 const bool[256] IS_TOKEN_CHAR @private = {
     ['0'..'9'] = true,
     ['A'..'Z'] = true,
@@ -74,362 +59,272 @@ const bool[256] IS_TOKEN_CHAR @private = {
 
 macro bool is_printable_ascii(char c) @private => c >= 0x20 && c <= 0x7e;
 
-// Fast slowloris countermeasure: scans for the terminating CRLFCRLF so we can
-// bail on incomplete input without re-parsing everything. Returns the position
-// just past the double line break, or null (setting *ret) if not yet complete.
-fn char* is_complete(char* buf, char* buf_end, usz last_len, int* ret) @private
-{
-    int ret_cnt = 0;
-    buf = last_len < 3 ? buf : buf + last_len - 3;
+// ---- cursor ----------------------------------------------------------------
 
+// A forward cursor over the input buffer. Its methods return optionals: `!`
+// propagates INCOMPLETE (ran off the end) or MALFORMED (bad byte) to the caller.
+struct Reader @private
+{
+    char[] buf;
+    usz    pos;
+}
+
+// Current byte without advancing; INCOMPLETE at end of input.
+fn char? Reader.peek(&self)
+{
+    if (self.pos >= self.buf.len) return INCOMPLETE~;
+    return self.buf[self.pos];
+}
+
+// Consume and return the current byte.
+fn char? Reader.next(&self)
+{
+    char c = self.peek()!;
+    self.pos++;
+    return c;
+}
+
+// Consume a byte that must equal `c`.
+fn void? Reader.expect(&self, char c)
+{
+    if (self.next()! != c) return MALFORMED~;
+}
+
+// Skip a run of byte `c`.
+fn void? Reader.skip(&self, char c)
+{
+    while (self.peek()! == c) self.pos++;
+}
+
+// Skip a run of SP / HTAB (optional whitespace).
+fn void? Reader.skip_ws(&self)
+{
     while (true)
     {
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        if (*buf == '\r')
+        char c = self.peek()!;
+        if (c != ' ' && c != '\t') break;
+        self.pos++;
+    }
+}
+
+// Consume a required line ending (CRLF or bare LF).
+fn void? Reader.eol(&self)
+{
+    switch (self.next()!)
+    {
+        case '\r': return self.expect('\n');
+        case '\n': return;
+        default:   return MALFORMED~;
+    }
+}
+
+// If positioned at a line ending, consume it and return true; else false.
+fn bool? Reader.at_eol(&self)
+{
+    switch (self.peek()!)
+    {
+        case '\r': self.pos++; self.expect('\n')!; return true;
+        case '\n': self.pos++; return true;
+        default:   return false;
+    }
+}
+
+// A tchar token ending at (but not consuming) `delim`.
+fn char[]? Reader.token(&self, char delim)
+{
+    usz start = self.pos;
+    for (char c = self.peek()!; c != delim; c = self.peek()!)
+    {
+        if (!IS_TOKEN_CHAR[c]) return MALFORMED~;
+        self.pos++;
+    }
+    return self.buf[start:self.pos - start];
+}
+
+// A request-target ending at (but not consuming) SP. Rejects controls and DEL;
+// bytes with the high bit set are allowed.
+fn char[]? Reader.target(&self)
+{
+    usz start = self.pos;
+    for (char c = self.peek()!; c != ' '; c = self.peek()!)
+    {
+        if (!is_printable_ascii(c) && (c < 0x20 || c == 0x7f)) return MALFORMED~;
+        self.pos++;
+    }
+    return self.buf[start:self.pos - start];
+}
+
+// The text up to the end of line; consumes the CR/LF. A control byte other than
+// HTAB / CR / LF ends the scan and is rejected as MALFORMED.
+fn char[]? Reader.line(&self)
+{
+    usz start = self.pos;
+    for (char c = self.peek()!; !((c < 0x20 && c != '\t') || c == 0x7f); c = self.peek()!)
+    {
+        self.pos++;
+    }
+    usz end = self.pos;
+    switch (self.buf[self.pos])
+    {
+        case '\r': self.pos++; self.expect('\n')!;
+        case '\n': self.pos++;
+        default:   return MALFORMED~;
+    }
+    return self.buf[start:end - start];
+}
+
+// A single decimal digit's value.
+fn int? Reader.digit(&self)
+{
+    char c = self.next()!;
+    if (c < '0' || c > '9') return MALFORMED~;
+    return (int)(c - '0');
+}
+
+// "HTTP/1.<minor>" -> the minor version.
+fn int? Reader.http_version(&self)
+{
+    // We want at least "HTTP/1.x" plus a lookahead byte before trying.
+    if (self.buf.len - self.pos < 9) return INCOMPLETE~;
+    self.expect('H')!; self.expect('T')!; self.expect('T')!; self.expect('P')!;
+    self.expect('/')!; self.expect('1')!; self.expect('.')!;
+    return self.digit()!;
+}
+
+// ---- structural parsers ----------------------------------------------------
+
+// Parse a header block into `out`, setting `*count`; `out.len` is the capacity.
+fn void? Reader.header_block(&self, Header[] out, usz* count)
+{
+    while (true)
+    {
+        usz n = *count;
+        if (self.at_eol()!) return;                 // blank line terminates
+        if (n == out.len) return MALFORMED~;        // no room
+
+        char c = self.peek()!;
+        if (n != 0 && (c == ' ' || c == '\t'))
         {
-            buf++;
-            if (buf == buf_end) { *ret = PARTIAL; return null; }
-            if (*buf++ != '\n') { *ret = INVALID; return null; }
-            ret_cnt++;
-        }
-        else if (*buf == '\n')
-        {
-            buf++;
-            ret_cnt++;
+            out[n].name = {};                       // obs-fold continuation line
         }
         else
         {
-            buf++;
-            ret_cnt = 0;
-        }
-        if (ret_cnt == 2) return buf;
-    }
-}
-
-// Reads up to (and consuming) the end of line, returning the token before the
-// CR/LF as a slice. Bytes 0x00-0x1F (except HTAB) and 0x7F terminate the line.
-fn char* get_token_to_eol(char* buf, char* buf_end, char[]* token, int* ret) @private
-{
-    char* token_start = buf;
-
-    // Scan to the first line-ending control character.
-    while (true)
-    {
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        char c = *buf;
-        if ((c < 0x20 && c != '\t') || c == 0x7f) break;
-        buf++;
-    }
-
-    usz token_len;
-    if (*buf == '\r')
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        if (*buf++ != '\n') { *ret = INVALID; return null; }
-        token_len = (usz)(buf - 2 - token_start);
-    }
-    else if (*buf == '\n')
-    {
-        token_len = (usz)(buf - token_start);
-        buf++;
-    }
-    else
-    {
-        *ret = INVALID;
-        return null;
-    }
-    *token = token_start[:token_len];
-    return buf;
-}
-
-// Parses a token that ends at `next_char` (the delimiter is left unconsumed).
-fn char* parse_token(char* buf, char* buf_end, char[]* token, char next_char, int* ret) @private
-{
-    char* buf_start = buf;
-    if (buf == buf_end) { *ret = PARTIAL; return null; }
-    while (true)
-    {
-        if (*buf == next_char) break;
-        if (!IS_TOKEN_CHAR[*buf]) { *ret = INVALID; return null; }
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-    }
-    *token = buf_start[:(usz)(buf - buf_start)];
-    return buf;
-}
-
-// Parses "HTTP/1.<minor>" leaving buf just past the minor version digit.
-fn char* parse_http_version(char* buf, char* buf_end, int* minor_version, int* ret) @private
-{
-    // We want at least [HTTP/1.<two chars>] to try to parse.
-    if (buf_end - buf < 9) { *ret = PARTIAL; return null; }
-    if (*buf++ != 'H') { *ret = INVALID; return null; }
-    if (*buf++ != 'T') { *ret = INVALID; return null; }
-    if (*buf++ != 'T') { *ret = INVALID; return null; }
-    if (*buf++ != 'P') { *ret = INVALID; return null; }
-    if (*buf++ != '/') { *ret = INVALID; return null; }
-    if (*buf++ != '1') { *ret = INVALID; return null; }
-    if (*buf++ != '.') { *ret = INVALID; return null; }
-    char c = *buf;
-    if (c < '0' || c > '9') { *ret = INVALID; return null; }
-    *minor_version = (int)(c - '0');
-    buf++;
-    return buf;
-}
-
-fn char* parse_headers_impl(char* buf, char* buf_end, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
-{
-    while (true)
-    {
-        usz n = *num_headers;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        if (*buf == '\r')
-        {
-            buf++;
-            if (buf == buf_end) { *ret = PARTIAL; return null; }
-            if (*buf++ != '\n') { *ret = INVALID; return null; }
-            break;
-        }
-        else if (*buf == '\n')
-        {
-            buf++;
-            break;
-        }
-        if (n == max_headers) { *ret = INVALID; return null; }
-        if (!(n != 0 && (*buf == ' ' || *buf == '\t')))
-        {
-            // Parsing a name; do not discard SP before the colon, see
+            // Do not discard SP before the colon, see
             // http://www.mozilla.org/security/announce/2006/mfsa2006-33.html
-            char[] name;
-            buf = parse_token(buf, buf_end, &name, ':', ret);
-            if (buf == null) return null;
-            if (name.len == 0) { *ret = INVALID; return null; }
-            headers[n].name = name;
-            buf++; // skip ':'
-            while (true)
-            {
-                if (buf == buf_end) { *ret = PARTIAL; return null; }
-                if (!(*buf == ' ' || *buf == '\t')) break;
-                buf++;
-            }
+            char[] name = self.token(':')!;
+            if (name.len == 0) return MALFORMED~;
+            out[n].name = name;
+            self.pos++;                             // skip ':'
+            self.skip_ws()!;
         }
-        else
-        {
-            // Continuation line of a multiline header.
-            headers[n].name = {};
-        }
-        char[] value;
-        buf = get_token_to_eol(buf, buf_end, &value, ret);
-        if (buf == null) return null;
-        // Remove trailing SPs and HTABs.
+
+        // Value: keep leading whitespace (obs-fold), trim only trailing SP/HTAB.
+        char[] value = self.line()!;
         usz vend = value.len;
-        while (vend != 0)
-        {
-            char c = value[vend - 1];
-            if (c != ' ' && c != '\t') break;
-            vend--;
-        }
-        headers[n].value = value[:vend];
-        *num_headers = n + 1;
+        while (vend != 0 && (value[vend - 1] == ' ' || value[vend - 1] == '\t')) vend--;
+        out[n].value = value[:vend];
+        *count = n + 1;
     }
-    return buf;
 }
 
-fn char* parse_request_impl(char* buf, char* buf_end, RequestHead* req, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
+fn void? Reader.request(&self, RequestHead* req, Header[] headers, usz* count)
 {
-    // Skip the first empty line (some clients add CRLF after POST content).
-    if (buf == buf_end) { *ret = PARTIAL; return null; }
-    if (*buf == '\r')
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        if (*buf++ != '\n') { *ret = INVALID; return null; }
-    }
-    else if (*buf == '\n')
-    {
-        buf++;
-    }
-
-    // Method. Written straight into the output as it is parsed, matching the
-    // original (outputs after a negative return are undefined either way).
-    buf = parse_token(buf, buf_end, &req.method, ' ', ret);
-    if (buf == null) return null;
-    do
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-    }
-    while (*buf == ' ');
-
-    // Path (the original ADVANCE_TOKEN macro, scalar version).
-    char* tok_start = buf;
-    while (true)
-    {
-        if (*buf == ' ') break;
-        if (!is_printable_ascii(*buf))
-        {
-            if (*buf < 0x20 || *buf == 0x7f) { *ret = INVALID; return null; }
-        }
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-    }
-    req.path = tok_start[:(usz)(buf - tok_start)];
-    do
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-    }
-    while (*buf == ' ');
-
-    if (req.method.len == 0 || req.path.len == 0) { *ret = INVALID; return null; }
-
-    buf = parse_http_version(buf, buf_end, &req.minor_version, ret);
-    if (buf == null) return null;
-
-    if (*buf == '\r')
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-        if (*buf++ != '\n') { *ret = INVALID; return null; }
-    }
-    else if (*buf == '\n')
-    {
-        buf++;
-    }
-    else
-    {
-        *ret = INVALID;
-        return null;
-    }
-
-    return parse_headers_impl(buf, buf_end, headers, num_headers, max_headers, ret);
+    if (self.at_eol()!) {}                           // skip a leading blank line
+    req.method = self.token(' ')!;
+    self.skip(' ')!;
+    req.path = self.target()!;
+    self.skip(' ')!;
+    if (req.method.len == 0 || req.path.len == 0) return MALFORMED~;
+    req.minor_version = self.http_version()!;
+    self.eol()!;
+    self.header_block(headers, count)!;
 }
 
-fn char* parse_response_impl(char* buf, char* buf_end, ResponseHead* resp, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
+fn void? Reader.response(&self, ResponseHead* resp, Header[] headers, usz* count)
 {
-    // Parse "HTTP/1.x". Fields are written into the output as parsed, matching
-    // the original (outputs after a negative return are undefined either way).
-    buf = parse_http_version(buf, buf_end, &resp.minor_version, ret);
-    if (buf == null) return null;
+    resp.minor_version = self.http_version()!;
+    self.expect(' ')!;
+    self.skip(' ')!;
+    // Status code: three digits plus at least one more byte.
+    if (self.buf.len - self.pos < 4) return INCOMPLETE~;
+    int d0 = self.digit()!;
+    int d1 = self.digit()!;
+    int d2 = self.digit()!;
+    resp.status = 100 * d0 + 10 * d1 + d2;
 
-    // Skip space(s).
-    if (*buf != ' ') { *ret = INVALID; return null; }
-    do
-    {
-        buf++;
-        if (buf == buf_end) { *ret = PARTIAL; return null; }
-    }
-    while (*buf == ' ');
+    // Message, including any preceding space; strip the leading spaces.
+    char[] msg = self.line()!;
+    if (msg.len != 0 && msg[0] != ' ') return MALFORMED~;
+    usz off = 0;
+    while (off < msg.len && msg[off] == ' ') off++;
+    resp.msg = msg[off:msg.len - off];
 
-    // Status code: we want at least three digits plus one more char.
-    if (buf_end - buf < 4) { *ret = PARTIAL; return null; }
-    char d0 = *buf;
-    if (d0 < '0' || d0 > '9') { *ret = INVALID; return null; }
-    resp.status = 100 * (int)(d0 - '0');
-    buf++;
-    char d1 = *buf;
-    if (d1 < '0' || d1 > '9') { *ret = INVALID; return null; }
-    resp.status += 10 * (int)(d1 - '0');
-    buf++;
-    char d2 = *buf;
-    if (d2 < '0' || d2 > '9') { *ret = INVALID; return null; }
-    resp.status += (int)(d2 - '0');
-    buf++;
-
-    // Message, including the preceding space.
-    buf = get_token_to_eol(buf, buf_end, &resp.msg, ret);
-    if (buf == null) return null;
-    if (resp.msg.len == 0)
-    {
-        // ok
-    }
-    else if (resp.msg[0] == ' ')
-    {
-        // Remove preceding spaces. A successful get_token_to_eol guarantees a
-        // non-space char before the end of buffer.
-        usz off = 0;
-        while (off < resp.msg.len && resp.msg[off] == ' ') off++;
-        resp.msg = resp.msg[off:resp.msg.len - off];
-    }
-    else
-    {
-        // Garbage after the status code.
-        *ret = INVALID;
-        return null;
-    }
-
-    return parse_headers_impl(buf, buf_end, headers, num_headers, max_headers, ret);
+    self.header_block(headers, count)!;
 }
+
+// Slowloris countermeasure: scan (from just before the previously-seen tail) for
+// the terminating CRLFCRLF, so an incomplete message fails fast without a full
+// parse. Succeeds if complete, throws INCOMPLETE otherwise.
+fn void? check_complete(char[] buf, usz last_len) @private
+{
+    Reader r = { .buf = buf, .pos = last_len < 3 ? 0 : last_len - 3 };
+    int run = 0;
+    while (run < 2)
+    {
+        switch (r.next()!)
+        {
+            case '\r': r.expect('\n')!; run++;
+            case '\n': run++;
+            default:   run = 0;
+        }
+    }
+}
+
+// ---- public API ------------------------------------------------------------
 
 <* Parse an HTTP request.
-
    @param buf : "the request bytes received so far"
    @param req : "filled in on success"
-   @param headers : "caller-provided storage; its length is the header capacity"
-   @param last_len : "length of the buffer at the previous call (0 on the first), used for the incremental slowloris check"
-   @return "number of bytes consumed on success, or PARTIAL / INVALID" *>
-fn int parse_request(char[] buf, RequestHead* req, Header[] headers, usz last_len)
+   @param headers : "caller storage; its length is the header capacity"
+   @param last_len : "length of buf at the previous call (0 on the first)"
+   @return "number of bytes consumed"
+   @return? INCOMPLETE : "need more input"
+   @return? MALFORMED : "invalid input" *>
+fn usz? parse_request(char[] buf, RequestHead* req, Header[] headers, usz last_len)
 {
-    char* start = buf.ptr;
-    char* end = start + buf.len;
-    usz max_headers = headers.len;
-    usz num_headers = 0;
-    int r;
-
     *req = {};
     req.minor_version = -1;
+    if (last_len != 0) check_complete(buf, last_len)!;
 
-    if (last_len != 0 && is_complete(start, end, last_len, &r) == null) return r;
-
-    char* p = parse_request_impl(start, end, req, headers, &num_headers, max_headers, &r);
-    if (p == null) return r;
-
-    req.headers = headers[:num_headers];
-    return (int)(p - start);
+    usz count = 0;
+    Reader r = { .buf = buf };
+    r.request(req, headers, &count)!;
+    req.headers = headers[:count];
+    return r.pos;
 }
 
 <* Parse an HTTP response. See `parse_request` for the parameter conventions. *>
-fn int parse_response(char[] buf, ResponseHead* resp, Header[] headers, usz last_len)
+fn usz? parse_response(char[] buf, ResponseHead* resp, Header[] headers, usz last_len)
 {
-    char* start = buf.ptr;
-    char* end = start + buf.len;
-    usz max_headers = headers.len;
-    usz num_headers = 0;
-    int r;
-
     *resp = {};
     resp.minor_version = -1;
+    if (last_len != 0) check_complete(buf, last_len)!;
 
-    if (last_len != 0 && is_complete(start, end, last_len, &r) == null) return r;
-
-    char* p = parse_response_impl(start, end, resp, headers, &num_headers, max_headers, &r);
-    if (p == null) return r;
-
-    resp.headers = headers[:num_headers];
-    return (int)(p - start);
+    usz count = 0;
+    Reader r = { .buf = buf };
+    r.response(resp, headers, &count)!;
+    resp.headers = headers[:count];
+    return r.pos;
 }
 
 <* Parse a bare block of HTTP headers (e.g. trailers).
-
-   @param buf : "the header bytes received so far"
-   @param headers : "caller-provided storage; its length is the header capacity"
-   @param num_headers : "set to the number of headers parsed"
-   @param last_len : "length of the buffer at the previous call (0 on the first)"
-   @return "number of bytes consumed on success, or PARTIAL / INVALID" *>
-fn int parse_headers(char[] buf, Header[] headers, usz* num_headers, usz last_len)
+   @param [&out] num_headers : "set to the number of headers parsed" *>
+fn usz? parse_headers(char[] buf, Header[] headers, usz* num_headers, usz last_len)
 {
-    char* start = buf.ptr;
-    char* end = start + buf.len;
-    usz max_headers = headers.len;
-    int r;
-
     *num_headers = 0;
+    if (last_len != 0) check_complete(buf, last_len)!;
 
-    if (last_len != 0 && is_complete(start, end, last_len, &r) == null) return r;
-
-    char* p = parse_headers_impl(start, end, headers, num_headers, max_headers, &r);
-    if (p == null) return r;
-
-    return (int)(p - start);
+    Reader r = { .buf = buf };
+    r.header_block(headers, num_headers)!;
+    return r.pos;
 }

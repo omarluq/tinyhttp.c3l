@@ -1,10 +1,8 @@
-// A C3 port of picohttpparser's chunked transfer-encoding decoder.
-// Upstream: https://github.com/h2o/picohttpparser (see parser.c3 for license).
+// An idiomatic C3 reimplementation of picohttpparser's chunked transfer-encoding
+// decoder. Upstream: https://github.com/h2o/picohttpparser (see parser.c3).
 
 module tinyhttp::parser;
 
-// Internal decoder states. The struct is designed to be zero-initialized, and
-// the first state (ordinal 0) is the correct starting state.
 enum ChunkedState : char @private
 {
     IN_CHUNK_SIZE,
@@ -17,15 +15,15 @@ enum ChunkedState : char @private
     IN_TRAILERS_LINE_MIDDLE,
 }
 
-<* State for `decode_chunked`. Must be zero-filled before the first call, which
-   a default-initialized value (`ChunkedDecoder dec;` or `= {}`) already is.
+<* State for `decode_chunked`. Must be zero-filled before the first call, which a
+   default-initialized value (`ChunkedDecoder dec;` or `= {}`) already is.
 
-   Set `consume_trailer = true` before decoding if trailing headers should be
-   consumed as part of the decode. The remaining fields are internal. *>
+   Set `consume_trailer = true` to consume trailing headers as part of the
+   decode. The remaining fields are internal. *>
 struct ChunkedDecoder
 {
-    usz  bytes_left_in_chunk; // bytes left in the current chunk
-    bool consume_trailer;     // whether trailing headers should be consumed
+    usz  bytes_left_in_chunk;
+    bool consume_trailer;
 
     ChunkedState _state;
     char         _hex_count;
@@ -41,28 +39,34 @@ fn int decode_hex(int ch) @private
     return -1;
 }
 
-<* Decode chunked transfer-encoding in place.
+<* Decode chunked transfer-encoding in place. Rewrites the first `*bufsz` bytes
+   of `buf`, removing the framing; on return `*bufsz` holds the decoded length.
+   Call repeatedly while it throws INCOMPLETE, each time appending new bytes. On
+   completion it returns the number of trailing octets left undecoded, starting
+   at offset `*bufsz`.
 
-   Rewrites `buf` (the first `*bufsz` bytes) removing the chunked-encoding
-   framing. On a clean return `*bufsz` is set to the length of the decoded data.
-   Call repeatedly while it returns PARTIAL, each time appending newly arrived
-   bytes. When the end of the chunked data is found it returns a non-negative
-   number: the count of trailing octets left undecoded, starting at offset
-   `*bufsz`.
-
-   @param decoder : "the decoder state (zero-filled before the first call)"
+   @param decoder : "zero-filled before the first call"
    @param buf : "mutable buffer; buf.len must be >= *bufsz"
-   @param bufsz : "in: valid bytes in buf; out: decoded byte count"
-   @return "octets left undecoded (>= 0) when complete, or PARTIAL / INVALID" *>
-fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
+   @param bufsz : "in: valid bytes in buf; out: decoded length"
+   @return "octets left undecoded once complete"
+   @return? INCOMPLETE : "need more input"
+   @return? MALFORMED : "invalid input" *>
+fn usz? decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
 {
     usz dst = 0;
     usz src = 0;
     usz size = *bufsz;
-    sz ret = PARTIAL; // incomplete
     char* b = buf.ptr;
 
     decoder._total_read += size;
+
+    // Compact the decoded bytes down to `dst` and publish the length on every
+    // exit path (this replaces the original's shared Exit block).
+    defer
+    {
+        if (dst != src) mem::move(b + dst, b + src, (sz)(size - src));
+        *bufsz = dst;
+    }
 
     while OUTER: (true)
     {
@@ -75,18 +79,13 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
                 int v = decode_hex((int)b[src]);
                 if (v == -1)
                 {
-                    if (decoder._hex_count == 0) { ret = INVALID; break OUTER; }
-                    // The only characters allowed after the chunk size are BWS,
-                    // a semicolon, or CR/LF.
+                    if (decoder._hex_count == 0) return MALFORMED~;
+                    // Only BWS, ';', or CR/LF may follow the chunk size.
                     char t = b[src];
-                    if (t != ' ' && t != '\t' && t != ';' && t != '\n' && t != '\r')
-                    {
-                        ret = INVALID;
-                        break OUTER;
-                    }
+                    if (t != ' ' && t != '\t' && t != ';' && t != '\n' && t != '\r') return MALFORMED~;
                     break;
                 }
-                if ((usz)decoder._hex_count == @sizeof((usz)0) * 2) { ret = INVALID; break OUTER; }
+                if ((usz)decoder._hex_count == @sizeof((usz)0) * 2) return MALFORMED~;
                 decoder.bytes_left_in_chunk = decoder.bytes_left_in_chunk * 16 + (usz)v;
                 decoder._hex_count++;
                 src++;
@@ -100,7 +99,7 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
             {
                 if (src == size) break OUTER;
                 if (b[src] == '\r') break;
-                if (b[src] == '\n') { ret = INVALID; break OUTER; }
+                if (b[src] == '\n') return MALFORMED~;
                 src++;
             }
             src++;
@@ -108,17 +107,12 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
             nextcase;
         case IN_CHUNK_HEADER_EXPECT_LF:
             if (src == size) break OUTER;
-            if (b[src] != '\n') { ret = INVALID; break OUTER; }
+            if (b[src] != '\n') return MALFORMED~;
             src++;
             if (decoder.bytes_left_in_chunk == 0)
             {
-                if (decoder.consume_trailer)
-                {
-                    decoder._state = IN_TRAILERS_LINE_HEAD;
-                    break;
-                }
-                ret = (sz)(size - src);
-                break OUTER;
+                if (decoder.consume_trailer) { decoder._state = IN_TRAILERS_LINE_HEAD; break; }
+                return size - src;                          // complete
             }
             decoder._state = IN_CHUNK_DATA;
             nextcase;
@@ -142,13 +136,13 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
             nextcase;
         case IN_CHUNK_DATA_EXPECT_CR:
             if (src == size) break OUTER;
-            if (b[src] != '\r') { ret = INVALID; break OUTER; }
+            if (b[src] != '\r') return MALFORMED~;
             src++;
             decoder._state = IN_CHUNK_DATA_EXPECT_LF;
             nextcase;
         case IN_CHUNK_DATA_EXPECT_LF:
             if (src == size) break OUTER;
-            if (b[src] != '\n') { ret = INVALID; break OUTER; }
+            if (b[src] != '\n') return MALFORMED~;
             src++;
             decoder._state = IN_CHUNK_SIZE;
             break;
@@ -159,7 +153,7 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
                 if (b[src] != '\r') break;
                 src++;
             }
-            if (b[src++] == '\n') { ret = (sz)(size - src); break OUTER; }
+            if (b[src++] == '\n') return size - src;        // complete
             decoder._state = IN_TRAILERS_LINE_MIDDLE;
             nextcase;
         case IN_TRAILERS_LINE_MIDDLE:
@@ -177,21 +171,15 @@ fn sz decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
         }
     }
 
-    // Exit / Complete: fold any remaining undecoded bytes down to `dst`.
-    if (dst != src) mem::move(b + dst, b + src, (sz)(size - src));
-    *bufsz = dst;
-    // If incomplete but the chunked-encoding overhead is >= 100KB and > 80% of
-    // the stream, treat it as an attack and fail.
-    if (ret == PARTIAL)
+    // Broke out of the loop: incomplete. If the framing overhead is >= 100 KB and
+    // more than 80% of the stream, treat it as an attack and fail.
+    decoder._total_overhead += size - dst;
+    if (decoder._total_overhead >= 100 * 1024 &&
+        decoder._total_read - decoder._total_overhead < decoder._total_read / 4)
     {
-        decoder._total_overhead += size - dst;
-        if (decoder._total_overhead >= 100 * 1024 &&
-            decoder._total_read - decoder._total_overhead < decoder._total_read / 4)
-        {
-            ret = INVALID;
-        }
+        return MALFORMED~;
     }
-    return ret;
+    return INCOMPLETE~;
 }
 
 <* Returns true if the chunked decoder is in the middle of chunk data. *>
