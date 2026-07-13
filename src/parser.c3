@@ -45,7 +45,7 @@ struct Header
 }
 
 // Populated by `parse_request` on success.
-struct Request
+struct RequestHead
 {
     char[]   method;
     char[]   path;
@@ -54,7 +54,7 @@ struct Request
 }
 
 // Populated by `parse_response` on success.
-struct Response
+struct ResponseHead
 {
     int      minor_version;
     int      status;
@@ -236,7 +236,7 @@ fn char* parse_headers_impl(char* buf, char* buf_end, Header[] headers, usz* num
     return buf;
 }
 
-fn char* parse_request_impl(char* buf, char* buf_end, Request* req, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
+fn char* parse_request_impl(char* buf, char* buf_end, RequestHead* req, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
 {
     // Skip the first empty line (some clients add CRLF after POST content).
     if (buf == buf_end) { *ret = PARTIAL; return null; }
@@ -251,9 +251,9 @@ fn char* parse_request_impl(char* buf, char* buf_end, Request* req, Header[] hea
         buf++;
     }
 
-    // Method.
-    char[] method;
-    buf = parse_token(buf, buf_end, &method, ' ', ret);
+    // Method. Written straight into the output as it is parsed, matching the
+    // original (outputs after a negative return are undefined either way).
+    buf = parse_token(buf, buf_end, &req.method, ' ', ret);
     if (buf == null) return null;
     do
     {
@@ -274,7 +274,7 @@ fn char* parse_request_impl(char* buf, char* buf_end, Request* req, Header[] hea
         buf++;
         if (buf == buf_end) { *ret = PARTIAL; return null; }
     }
-    char[] path = tok_start[:(usz)(buf - tok_start)];
+    req.path = tok_start[:(usz)(buf - tok_start)];
     do
     {
         buf++;
@@ -282,10 +282,9 @@ fn char* parse_request_impl(char* buf, char* buf_end, Request* req, Header[] hea
     }
     while (*buf == ' ');
 
-    if (method.len == 0 || path.len == 0) { *ret = INVALID; return null; }
+    if (req.method.len == 0 || req.path.len == 0) { *ret = INVALID; return null; }
 
-    int minor_version;
-    buf = parse_http_version(buf, buf_end, &minor_version, ret);
+    buf = parse_http_version(buf, buf_end, &req.minor_version, ret);
     if (buf == null) return null;
 
     if (*buf == '\r')
@@ -304,17 +303,14 @@ fn char* parse_request_impl(char* buf, char* buf_end, Request* req, Header[] hea
         return null;
     }
 
-    req.method = method;
-    req.path = path;
-    req.minor_version = minor_version;
     return parse_headers_impl(buf, buf_end, headers, num_headers, max_headers, ret);
 }
 
-fn char* parse_response_impl(char* buf, char* buf_end, Response* resp, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
+fn char* parse_response_impl(char* buf, char* buf_end, ResponseHead* resp, Header[] headers, usz* num_headers, usz max_headers, int* ret) @private
 {
-    // Parse "HTTP/1.x".
-    int minor_version;
-    buf = parse_http_version(buf, buf_end, &minor_version, ret);
+    // Parse "HTTP/1.x". Fields are written into the output as parsed, matching
+    // the original (outputs after a negative return are undefined either way).
+    buf = parse_http_version(buf, buf_end, &resp.minor_version, ret);
     if (buf == null) return null;
 
     // Skip space(s).
@@ -328,35 +324,33 @@ fn char* parse_response_impl(char* buf, char* buf_end, Response* resp, Header[] 
 
     // Status code: we want at least three digits plus one more char.
     if (buf_end - buf < 4) { *ret = PARTIAL; return null; }
-    int status;
     char d0 = *buf;
     if (d0 < '0' || d0 > '9') { *ret = INVALID; return null; }
-    status = 100 * (int)(d0 - '0');
+    resp.status = 100 * (int)(d0 - '0');
     buf++;
     char d1 = *buf;
     if (d1 < '0' || d1 > '9') { *ret = INVALID; return null; }
-    status += 10 * (int)(d1 - '0');
+    resp.status += 10 * (int)(d1 - '0');
     buf++;
     char d2 = *buf;
     if (d2 < '0' || d2 > '9') { *ret = INVALID; return null; }
-    status += (int)(d2 - '0');
+    resp.status += (int)(d2 - '0');
     buf++;
 
     // Message, including the preceding space.
-    char[] msg;
-    buf = get_token_to_eol(buf, buf_end, &msg, ret);
+    buf = get_token_to_eol(buf, buf_end, &resp.msg, ret);
     if (buf == null) return null;
-    if (msg.len == 0)
+    if (resp.msg.len == 0)
     {
         // ok
     }
-    else if (msg[0] == ' ')
+    else if (resp.msg[0] == ' ')
     {
         // Remove preceding spaces. A successful get_token_to_eol guarantees a
         // non-space char before the end of buffer.
         usz off = 0;
-        while (off < msg.len && msg[off] == ' ') off++;
-        msg = msg[off:msg.len - off];
+        while (off < resp.msg.len && resp.msg[off] == ' ') off++;
+        resp.msg = resp.msg[off:resp.msg.len - off];
     }
     else
     {
@@ -365,9 +359,6 @@ fn char* parse_response_impl(char* buf, char* buf_end, Response* resp, Header[] 
         return null;
     }
 
-    resp.minor_version = minor_version;
-    resp.status = status;
-    resp.msg = msg;
     return parse_headers_impl(buf, buf_end, headers, num_headers, max_headers, ret);
 }
 
@@ -378,7 +369,7 @@ fn char* parse_response_impl(char* buf, char* buf_end, Response* resp, Header[] 
    @param headers : "caller-provided storage; its length is the header capacity"
    @param last_len : "length of the buffer at the previous call (0 on the first), used for the incremental slowloris check"
    @return "number of bytes consumed on success, or PARTIAL / INVALID" *>
-fn int parse_request(char[] buf, Request* req, Header[] headers, usz last_len)
+fn int parse_request(char[] buf, RequestHead* req, Header[] headers, usz last_len)
 {
     char* start = buf.ptr;
     char* end = start + buf.len;
@@ -399,7 +390,7 @@ fn int parse_request(char[] buf, Request* req, Header[] headers, usz last_len)
 }
 
 <* Parse an HTTP response. See `parse_request` for the parameter conventions. *>
-fn int parse_response(char[] buf, Response* resp, Header[] headers, usz last_len)
+fn int parse_response(char[] buf, ResponseHead* resp, Header[] headers, usz last_len)
 {
     char* start = buf.ptr;
     char* end = start + buf.len;

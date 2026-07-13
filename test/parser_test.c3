@@ -22,7 +22,7 @@ macro char[] fill(char[] storage, String s) @local
 fn void test_request_simple() @test
 {
     String req = "GET / HTTP/1.0\r\n\r\n";
-    Request r;
+    RequestHead r;
     Header[8] hdrs;
     int rc = parse_request(req, &r, hdrs[..], 0);
     assert(rc == (int)req.len);
@@ -35,7 +35,7 @@ fn void test_request_simple() @test
 fn void test_request_headers() @test
 {
     String req = "GET /hi HTTP/1.1\r\nHost: example.com\r\nCookie: \r\n\r\n";
-    Request r;
+    RequestHead r;
     Header[8] hdrs;
     int rc = parse_request(req, &r, hdrs[..], 0);
     assert(rc == (int)req.len);
@@ -53,7 +53,7 @@ fn void test_request_multiple_spaces() @test
 {
     // Multiple spaces between tokens are allowed.
     String req = "GET   /   HTTP/1.0\r\n\r\n";
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     int rc = parse_request(req, &r, hdrs[..], 0);
     assert(rc == (int)req.len);
@@ -65,7 +65,7 @@ fn void test_request_trailing_ws_trim() @test
 {
     // Trailing SP/HTAB in a value are stripped; internal ones kept.
     String req = "GET / HTTP/1.0\r\nH: a b  \t \r\n\r\n";
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     int rc = parse_request(req, &r, hdrs[..], 0);
     assert(rc == (int)req.len);
@@ -78,7 +78,7 @@ fn void test_request_multiline_continuation() @test
 {
     // Obs-fold continuation line has a zero-length header name.
     String req = "GET / HTTP/1.0\r\nFoo: ab\r\n bc\r\n\r\n";
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     int rc = parse_request(req, &r, hdrs[..], 0);
     assert(rc == (int)req.len);
@@ -94,7 +94,7 @@ fn void test_request_multiline_continuation() @test
 fn void test_request_partial() @test
 {
     String req = "GET / HTTP/1.0\r\n\r";
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     assert(parse_request(req, &r, hdrs[..], 0) == PARTIAL);
 
@@ -105,7 +105,7 @@ fn void test_request_partial() @test
 
 fn void test_request_invalid() @test
 {
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     // Bad HTTP version token.
     assert(parse_request("GET / HTXP/1.0\r\n\r\n", &r, hdrs[..], 0) == INVALID);
@@ -119,7 +119,7 @@ fn void test_request_invalid() @test
 fn void test_request_slowloris() @test
 {
     // last_len != 0 triggers the incremental completeness check.
-    Request r;
+    RequestHead r;
     Header[4] hdrs;
     // Not complete yet.
     String p = "GET / HTTP/1.0\r\nHost: x\r\n";
@@ -134,7 +134,7 @@ fn void test_request_slowloris() @test
 fn void test_response_simple() @test
 {
     String resp = "HTTP/1.1 200 OK\r\n\r\n";
-    Response r;
+    ResponseHead r;
     Header[8] hdrs;
     int rc = parse_response(resp, &r, hdrs[..], 0);
     assert(rc == (int)resp.len);
@@ -147,7 +147,7 @@ fn void test_response_simple() @test
 fn void test_response_headers_and_long_msg() @test
 {
     String resp = "HTTP/1.0 500 Internal Server Error\r\nX-Y: z\r\n\r\n";
-    Response r;
+    ResponseHead r;
     Header[8] hdrs;
     int rc = parse_response(resp, &r, hdrs[..], 0);
     assert(rc == (int)resp.len);
@@ -161,7 +161,7 @@ fn void test_response_headers_and_long_msg() @test
 fn void test_response_empty_msg() @test
 {
     String resp = "HTTP/1.1 200 \r\n\r\n";
-    Response r;
+    ResponseHead r;
     Header[4] hdrs;
     int rc = parse_response(resp, &r, hdrs[..], 0);
     assert(rc == (int)resp.len);
@@ -171,7 +171,7 @@ fn void test_response_empty_msg() @test
 
 fn void test_response_partial_and_invalid() @test
 {
-    Response r;
+    ResponseHead r;
     Header[4] hdrs;
     assert(parse_response("HTTP/1.1 200 OK\r\n", &r, hdrs[..], 0) == PARTIAL);
     assert(parse_response("HTTP/1.1 2", &r, hdrs[..], 0) == PARTIAL);
