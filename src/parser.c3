@@ -9,10 +9,11 @@
 //
 // This is NOT a line-by-line port: it walks the input with a slice-based
 // `Reader` cursor and signals progress with optionals (`!` propagates the
-// INCOMPLETE / MALFORMED faults). Observable behaviour — including the obs-fold
-// leading-whitespace quirk and the slowloris completeness check — matches the
-// original. `char` is unsigned 8-bit in C3, so the original `(unsigned char)`
-// casts are unnecessary.
+// INCOMPLETE / MALFORMED faults). Observable behaviour — including the slowloris
+// completeness check — matches the original, with one deliberate deviation:
+// obs-fold continuation lines are rejected as MALFORMED (RFC 7230 §3.2.4
+// deprecates them). `char` is unsigned 8-bit in C3, so the original
+// `(unsigned char)` casts are unnecessary.
 
 module httpparser;
 
@@ -21,15 +22,15 @@ module httpparser;
    - MALFORMED:  the input is invalid. *>
 faultdef INCOMPLETE, MALFORMED;
 
-<* A single HTTP header. `name` has length 0 when the line is an obs-fold
-   continuation of the previous header's value. *>
+<* A single HTTP header: a name slice and a value slice into the caller's
+   buffer. *>
 struct Header
 {
     char[] name;
     char[] value;
 }
 
-// Populated by `parse_request` on success.
+<* Populated by `parse_request` on success. *>
 struct Request
 {
     char[]   method;
@@ -38,7 +39,7 @@ struct Request
     Header[] headers;   // sub-slice of the caller's header buffer that was filled
 }
 
-// Populated by `parse_response` on success.
+<* Populated by `parse_response` on success. *>
 struct Response
 {
     int      minor_version;
@@ -56,8 +57,6 @@ const bool[256] IS_TOKEN_CHAR @private = {
     ['\''] = true, ['*'] = true, ['+'] = true, ['-'] = true, ['.'] = true,
     ['^'] = true, ['_'] = true, ['`'] = true, ['|'] = true, ['~'] = true,
 };
-
-macro bool is_printable_ascii(char c) @private => c >= 0x20 && c <= 0x7e;
 
 // ---- cursor ----------------------------------------------------------------
 
@@ -148,7 +147,7 @@ fn char[]? Reader.target(&self)
     usz start = self.pos;
     for (char c = self.peek()!; c != ' '; c = self.peek()!)
     {
-        if (!is_printable_ascii(c) && (c < 0x20 || c == 0x7f)) return MALFORMED~;
+        if (c < 0x20 || c == 0x7f) return MALFORMED~;
         self.pos++;
     }
     return self.buf[start:self.pos - start];
@@ -203,22 +202,17 @@ fn void? Reader.header_block(&self, Header[] out, usz* count)
         if (n == out.len) return MALFORMED~;        // no room
 
         char c = self.peek()!;
-        if (n != 0 && (c == ' ' || c == '\t'))
-        {
-            out[n].name = {};                       // obs-fold continuation line
-        }
-        else
-        {
-            // Do not discard SP before the colon, see
-            // http://www.mozilla.org/security/announce/2006/mfsa2006-33.html
-            char[] name = self.token(':')!;
-            if (name.len == 0) return MALFORMED~;
-            out[n].name = name;
-            self.pos++;                             // skip ':'
-            self.skip_ws()!;
-        }
+        if (n != 0 && (c == ' ' || c == '\t')) return MALFORMED~;   // obs-fold continuation rejected (RFC 7230 §3.2.4)
 
-        // Value: keep leading whitespace (obs-fold), trim only trailing SP/HTAB.
+        // Do not discard SP before the colon, see
+        // http://www.mozilla.org/security/announce/2006/mfsa2006-33.html
+        char[] name = self.token(':')!;
+        if (name.len == 0) return MALFORMED~;
+        out[n].name = name;
+        self.pos++;                             // skip ':'
+        self.skip_ws()!;
+
+        // Value: trailing SP/HTAB trimmed (leading already consumed by skip_ws).
         char[] value = self.line()!;
         usz vend = value.len;
         while (vend != 0 && (value[vend - 1] == ' ' || value[vend - 1] == '\t')) vend--;
@@ -229,7 +223,7 @@ fn void? Reader.header_block(&self, Header[] out, usz* count)
 
 fn void? Reader.request(&self, Request* req, Header[] headers, usz* count)
 {
-    if (self.at_eol()!) {}                           // skip a leading blank line
+    self.at_eol()!;                                  // skip a leading blank line
     req.method = self.token(' ')!;
     self.skip(' ')!;
     req.path = self.target()!;
@@ -318,6 +312,7 @@ fn usz? parse_response(char[] buf, Response* resp, Header[] headers, usz last_le
 }
 
 <* Parse a bare block of HTTP headers (e.g. trailers).
+   See `parse_request` for the shared parameter conventions.
    @param [&out] num_headers : "set to the number of headers parsed" *>
 fn usz? parse_headers(char[] buf, Header[] headers, usz* num_headers, usz last_len)
 {

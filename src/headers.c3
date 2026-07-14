@@ -3,7 +3,7 @@
 module tinyhttp;
 import httpparser;
 
-// name/value header (name.len == 0 marks an obs-fold continuation line).
+// name/value header, shared with the parser.
 alias Header = httpparser::Header;
 
 // Case-insensitive equality. Accepts a raw char[] token (as the parser produces)
@@ -14,6 +14,6 @@ fn bool ci_eq(char[] a, String b) @private => ((String)a).compare_to_ignore_case
    string if the header is absent. *>
 fn String find_header(Header[] headers, String name) @private
 {
-    foreach (h : headers) if (ci_eq(h.name, name)) return (String)h.value;
+    foreach (&h : headers) if (ci_eq(h.name, name)) return (String)h.value;
     return "";
 }

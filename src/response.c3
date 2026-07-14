@@ -15,13 +15,22 @@ struct Response
     Allocator allocator;
 }
 
-// True for a 2xx status.
+<* True for a 2xx status. *>
 fn bool Response.ok(&self) => self.status >= 200 && self.status < 300;
 
 <* Case-insensitive lookup of a header value, or an empty string if absent. *>
 fn String Response.header(&self, String name) => find_header(self.headers, name);
 
-// Free the backing buffer and header array. Idempotent (null-safe + self-reset).
+<* True if a header named `name` is present (case-insensitive), even when its
+   value is empty. Distinguishes absent from present-but-empty, which
+   `header` (empty-string sentinel) cannot. *>
+fn bool Response.has_header(&self, String name)
+{
+    foreach (&h : self.headers) if (ci_eq(h.name, name)) return true;
+    return false;
+}
+
+<* Free the backing buffer and header array. Idempotent (null-safe + self-reset). *>
 fn void Response.free(&self)
 {
     alloc::free(self.allocator, self.raw.ptr);

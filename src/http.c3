@@ -4,16 +4,22 @@
 
 module tinyhttp;
 import httpparser;
+import std::io;
 import std::net::url;
 import std::time;
 
 faultdef
     UNSUPPORTED_SCHEME,   // only http:// so far
     CONNECT_FAILED,       // could not reach the peer
-    WRITE_FAILED,         // socket closed mid-write
+    TIMEOUT,              // connect timed out
+    DNS_FAILED,           // host name / address resolution failed
+    INVALID_HEADER,       // caller header name/value contains CR or LF
+    TOO_MANY_HEADERS,     // more headers supplied than MAX_HEADERS
+    RESPONSE_TOO_LARGE,   // response exceeded MAX_RESPONSE_BYTES
     MALFORMED_RESPONSE;   // response could not be parsed
 
 const usz MAX_RESPONSE_HEADERS @private = 100;
+const usz MAX_RESPONSE_BYTES @private = 32 * 1024 * 1024;
 
 <* Send a request over an already-open connection and read the response. The
    low-level entry point: convenience wrappers and `Client` build on it, and
@@ -27,17 +33,18 @@ fn Response? send(Allocator allocator, Conn conn, Method method, String host, St
 fn Response? read_response(Allocator allocator, Conn conn) @private
 {
     // Read the whole response (Connection: close) into one buffer.
-    DString acc = dstring::new(allocator);
-    defer acc.free();
+    ByteWriter w;
+    w.init(allocator);
+    defer catch (void)w.destroy();   // frees the buffer on any fault exit; on success Response owns it
     char[4096] chunk;
     while (true)
     {
         sz n = conn.read(chunk[..])!;
         if (n <= 0) break;
-        acc.append_bytes(chunk[:(usz)n]);
+        w.write(chunk[:(usz)n])!;
+        if ((usz)w.index > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
     }
-    char[] raw = acc.copy_str(allocator);
-    defer catch alloc::free(allocator, raw.ptr);   // freed only if we bail out below
+    char[] raw = w.array_view();   // .ptr == allocation base; Response.free frees it
 
     // Parse the status line + headers.
     httpparser::Header[MAX_RESPONSE_HEADERS] hstore;
@@ -48,7 +55,14 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
     // Frame the body: chunked, Content-Length, or read-to-EOF.
     char[] rest = raw[consumed..];
     char[] body;
-    if (ci_eq(find_header(presp.headers, "Transfer-Encoding"), "chunked"))
+    String te = find_header(presp.headers, "Transfer-Encoding");
+    bool is_chunked = false;
+    if (te.len != 0)
+    {
+        String[] parts = te.tsplit(",");
+        is_chunked = ci_eq((char[])parts[^1].trim(), "chunked");
+    }
+    if (is_chunked)
     {
         httpparser::ChunkedDecoder dec = { .consume_trailer = true };
         usz bsz = rest.len;
@@ -90,29 +104,46 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
 
 // ---- convenience wrappers (open a connection, send, close) ------------------
 
-<* Perform `method url` over a fresh connection. `url` must be http://. *>
-fn Response? request_url(Allocator allocator, Method method, String url, Header[] headers = {}, char[] body = {}, Duration timeout = {})
+<* Parse `url_str` (must be http://) into the connect `Url`, the RFC 7230 §5.4
+   Host header value (host, plus non-default port), and the request-target
+   (percent-re-encoded path + raw query). *>
+fn void? make_request_target(String url_str, Url* u, String* host_hdr, String* target) @private
 {
-    Url u = url::parse(tmem, url)!;
+    *u = url::parse(tmem, url_str)!;
     if (!ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
     int port = u.port ?: 80;
-    String path = u.path.len != 0 ? u.path : "/";
-    if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);
-
-    PlainConn conn = dial(u.host, port, timeout)!;
-    defer (void)conn.close();
-    return send(allocator, &conn, method, u.host, path, headers, body);
+    *host_hdr = port == 80 ? u.host : string::tformat("%s:%d", u.host, port);
+    String path = u.path.len != 0 ? url::tencode(u.path, url::UrlEncodingMode.PATH) : "/";  // re-encode path
+    if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);                   // query left un-decoded by url::parse
+    *target = path;
 }
 
-fn Response? get(Allocator allocator, String url, Header[] headers = {})
-    => request_url(allocator, GET, url, headers);
-fn Response? head(Allocator allocator, String url, Header[] headers = {})
-    => request_url(allocator, HEAD, url, headers);
-fn Response? delete(Allocator allocator, String url, Header[] headers = {})
-    => request_url(allocator, DELETE, url, headers);
-fn Response? post(Allocator allocator, String url, char[] body, Header[] headers = {})
-    => request_url(allocator, POST, url, headers, body);
-fn Response? put(Allocator allocator, String url, char[] body, Header[] headers = {})
-    => request_url(allocator, PUT, url, headers, body);
-fn Response? patch(Allocator allocator, String url, char[] body, Header[] headers = {})
-    => request_url(allocator, PATCH, url, headers, body);
+<* Perform `method url_str` over a fresh connection. `url_str` must be http://. *>
+fn Response? request_url(Method method, String url_str, Header[] headers = {}, char[] body = {}, Duration timeout = time::DURATION_ZERO, Allocator allocator = tmem)
+{
+    Url u; String host_hdr; String target;
+    make_request_target(url_str, &u, &host_hdr, &target)!;
+    int port = u.port ?: 80;
+    PlainConn conn = dial(u.host, port, timeout)!;
+    defer (void)conn.close();
+    return send(allocator, &conn, method, host_hdr, target, headers, body);
+}
+
+<* Perform `GET url` over a fresh connection. `url` must be http://. *>
+fn Response? get(String url, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(GET, url, headers, allocator: allocator);
+<* Perform `HEAD url` over a fresh connection. `url` must be http://. *>
+fn Response? head(String url, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(HEAD, url, headers, allocator: allocator);
+<* Perform `DELETE url` over a fresh connection. `url` must be http://. *>
+fn Response? delete(String url, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(DELETE, url, headers, allocator: allocator);
+<* Perform `POST url` with `body` over a fresh connection. `url` must be http://. *>
+fn Response? post(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(POST, url, headers, body, allocator: allocator);
+<* Perform `PUT url` with `body` over a fresh connection. `url` must be http://. *>
+fn Response? put(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(PUT, url, headers, body, allocator: allocator);
+<* Perform `PATCH url` with `body` over a fresh connection. `url` must be http://. *>
+fn Response? patch(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
+    => request_url(PATCH, url, headers, body, allocator: allocator);

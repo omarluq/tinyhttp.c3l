@@ -3,19 +3,20 @@
 // or a test mock can implement the same interface with nothing above changing.
 
 module tinyhttp;
+import std::io;
+import std::net;
 import std::net::tcp;
 import std::time;
 
-<* A blocking byte transport. `read`/`write` return the number of bytes moved
-   (0 from `read` means the peer closed), or a fault on error. *>
-interface Conn
+<* A blocking byte transport built on the stdlib stream interfaces:
+   `read`/`write` move bytes (0 from `read` == peer closed) or fault;
+   `close` releases the underlying resource. *>
+interface Conn : InStream, OutStream
 {
-    fn sz? read(char[] buf);
-    fn sz? write(char[] buf);
     fn void? close();
 }
 
-// A plain (cleartext) TCP connection.
+<* A plain (cleartext) TCP connection. *>
 struct PlainConn (Conn)
 {
     TcpSocket sock;
@@ -23,17 +24,26 @@ struct PlainConn (Conn)
 
 fn sz? PlainConn.read(&self, char[] buf) @dynamic => self.sock.read(buf);
 fn sz? PlainConn.write(&self, char[] buf) @dynamic => self.sock.write(buf);
+fn char? PlainConn.read_byte(&self) @dynamic => self.sock.read_byte();
+fn void? PlainConn.write_byte(&self, char c) @dynamic => self.sock.write_byte(c);
 fn void? PlainConn.close(&self) @dynamic => self.sock.close();
 
 <* Open a plain TCP connection to host:port (timeout 0 = block indefinitely).
 
-   KNOWN LIMITATION: a non-zero timeout routes through the stdlib's non-blocking
-   `connect_with_timeout`, which on c3c 0.8.2/Linux mishandles the normal
-   EINPROGRESS (errno 115) from a non-blocking connect and fails with
-   `io::GENERAL_ERROR`. Until that upstream bug is fixed, timeout 0 (the default)
-   is the reliable path. The wiring here is correct and will work once it lands. *>
-fn PlainConn? dial(String host, int port, Duration timeout = {})
+   Maps the underlying `tcp::connect` fault onto tinyhttp's faults:
+   `net::CONNECTION_TIMED_OUT` -> `TIMEOUT`, `net::ADDRINFO_FAILED` ->
+   `DNS_FAILED`, everything else -> `CONNECT_FAILED`. *>
+fn PlainConn? dial(String host, int port, Duration timeout = time::DURATION_ZERO)
 {
-    if (try sock = tcp::connect(host, port, timeout)) return { .sock = sock };
-    return CONNECT_FAILED~;
+    TcpSocket? sock = tcp::connect(host, port, timeout);
+    if (catch err = sock)
+    {
+        switch (err)
+        {
+            case net::CONNECTION_TIMED_OUT: return TIMEOUT~;
+            case net::ADDRINFO_FAILED:      return DNS_FAILED~;
+            default:                        return CONNECT_FAILED~;
+        }
+    }
+    return { .sock = sock };
 }

@@ -76,17 +76,11 @@ fn void test_request_trailing_ws_trim() @test
 
 fn void test_request_multiline_continuation() @test
 {
-    // Obs-fold continuation line has a zero-length header name.
+    // #8: obs-fold continuation lines are rejected as MALFORMED (RFC 7230 §3.2.4).
     String req = "GET / HTTP/1.0\r\nFoo: ab\r\n bc\r\n\r\n";
     Request r;
     Header[4] hdrs;
-    @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
-    assert(r.headers.len == 2);
-    assert(seq(r.headers[0].name, "Foo"));
-    assert(seq(r.headers[0].value, "ab"));
-    assert(r.headers[1].name.len == 0);
-    // Obs-fold preserves leading whitespace; only trailing is trimmed.
-    assert(seq(r.headers[1].value, " bc"));
+    @assert_fault(parse_request(req, &r, hdrs[..], 0), MALFORMED);
 }
 
 fn void test_request_partial() @test
@@ -107,6 +101,24 @@ fn void test_request_invalid() @test
     @assert_fault(parse_request("GET / HTTP/1.0\r\n: v\r\n\r\n", &r, hdrs[..], 0), MALFORMED); // empty name
     Header[1] one;
     @assert_fault(parse_request("GET / HTTP/1.0\r\nA: b\r\nC: d\r\n\r\n", &r, one[..], 0), MALFORMED); // too many
+}
+
+fn void test_request_target_high_bit_and_controls() @test
+{
+    // #24: target() rejects controls (< 0x20) and DEL (0x7f) but accepts bytes
+    // with the high bit set. Guards the simplified control-byte check.
+    Request r;
+    Header[4] hdrs;
+
+    // High-bit byte in the request-target is allowed.
+    String ok = "GET /\x80\xff HTTP/1.0\r\n\r\n";
+    @assert_ok(parse_request(ok, &r, hdrs[..], 0), ok.len);
+    assert(seq(r.path, "/\x80\xff"));
+
+    // DEL (0x7f) in the target is rejected.
+    @assert_fault(parse_request("GET /\x7f HTTP/1.0\r\n\r\n", &r, hdrs[..], 0), MALFORMED);
+    // A control byte (0x1f) in the target is rejected.
+    @assert_fault(parse_request("GET /\x1f HTTP/1.0\r\n\r\n", &r, hdrs[..], 0), MALFORMED);
 }
 
 fn void test_request_slowloris() @test
@@ -261,12 +273,22 @@ fn void test_decode_hex() @test
     assert(decode_hex(' ') == -1);
 }
 
-fn void test_is_printable_ascii() @test
+fn void test_decode_hex_boundaries() @test
 {
-    assert(is_printable_ascii(' '));
-    assert(is_printable_ascii('~'));
-    assert(!is_printable_ascii('\t'));
-    assert(!is_printable_ascii(0x1f));
-    assert(!is_printable_ascii(0x7f));
-    assert(!is_printable_ascii(0x80));
+    // #16: decode_hex via is_xdigit/from_hex. Every hex digit maps to its value,
+    // and bytes just outside each hex range return the -1 sentinel.
+    for (int i = 0; i <= 9; i++) assert(decode_hex('0' + i) == i);
+    for (int i = 0; i < 6; i++)
+    {
+        assert(decode_hex('a' + i) == 10 + i);
+        assert(decode_hex('A' + i) == 10 + i);
+    }
+    // Just outside the digit / hex-letter ranges: still the -1 sentinel.
+    assert(decode_hex('/') == -1);   // '0' - 1
+    assert(decode_hex(':') == -1);   // '9' + 1
+    assert(decode_hex('@') == -1);   // 'A' - 1
+    assert(decode_hex('G') == -1);   // 'F' + 1
+    assert(decode_hex('`') == -1);   // 'a' - 1
+    assert(decode_hex('g') == -1);   // 'f' + 1
+    assert(decode_hex(0x80) == -1);  // high-bit byte
 }

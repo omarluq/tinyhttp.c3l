@@ -33,10 +33,8 @@ struct ChunkedDecoder
 
 fn int decode_hex(int ch) @private
 {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 0xa;
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 0xa;
-    return -1;
+    char c = (char)ch;
+    return c.is_xdigit() ? (int)c.from_hex() : -1;
 }
 
 <* Decode chunked transfer-encoding in place. Rewrites the first `*bufsz` bytes
