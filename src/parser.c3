@@ -14,7 +14,7 @@
 // original. `char` is unsigned 8-bit in C3, so the original `(unsigned char)`
 // casts are unnecessary.
 
-module tinyhttp::parser;
+module httpparser;
 
 <* Faults thrown by the parse_* functions:
    - INCOMPLETE: the input is a valid prefix; call again with more bytes.
@@ -30,7 +30,7 @@ struct Header
 }
 
 // Populated by `parse_request` on success.
-struct RequestHead
+struct Request
 {
     char[]   method;
     char[]   path;
@@ -39,7 +39,7 @@ struct RequestHead
 }
 
 // Populated by `parse_response` on success.
-struct ResponseHead
+struct Response
 {
     int      minor_version;
     int      status;
@@ -227,7 +227,7 @@ fn void? Reader.header_block(&self, Header[] out, usz* count)
     }
 }
 
-fn void? Reader.request(&self, RequestHead* req, Header[] headers, usz* count)
+fn void? Reader.request(&self, Request* req, Header[] headers, usz* count)
 {
     if (self.at_eol()!) {}                           // skip a leading blank line
     req.method = self.token(' ')!;
@@ -240,7 +240,7 @@ fn void? Reader.request(&self, RequestHead* req, Header[] headers, usz* count)
     self.header_block(headers, count)!;
 }
 
-fn void? Reader.response(&self, ResponseHead* resp, Header[] headers, usz* count)
+fn void? Reader.response(&self, Response* resp, Header[] headers, usz* count)
 {
     resp.minor_version = self.http_version()!;
     self.expect(' ')!;
@@ -290,7 +290,7 @@ fn void? check_complete(char[] buf, usz last_len) @private
    @return "number of bytes consumed"
    @return? INCOMPLETE : "need more input"
    @return? MALFORMED : "invalid input" *>
-fn usz? parse_request(char[] buf, RequestHead* req, Header[] headers, usz last_len)
+fn usz? parse_request(char[] buf, Request* req, Header[] headers, usz last_len)
 {
     *req = {};
     req.minor_version = -1;
@@ -304,7 +304,7 @@ fn usz? parse_request(char[] buf, RequestHead* req, Header[] headers, usz last_l
 }
 
 <* Parse an HTTP response. See `parse_request` for the parameter conventions. *>
-fn usz? parse_response(char[] buf, ResponseHead* resp, Header[] headers, usz last_len)
+fn usz? parse_response(char[] buf, Response* resp, Header[] headers, usz last_len)
 {
     *resp = {};
     resp.minor_version = -1;

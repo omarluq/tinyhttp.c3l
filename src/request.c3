@@ -1,6 +1,10 @@
-// HTTP method + request serialization over a Conn.
+// HTTP method, request serialization, and the fluent request builder.
 
 module tinyhttp;
+import std::time;
+
+const String USER_AGENT @private = "tinyhttp/0.1";
+const usz    MAX_HEADERS = 32;   // capacity of the builder / merged-header arrays
 
 // Each method carries its on-the-wire name (e.g. GET.name == "GET").
 enum Method : char (String name)
@@ -26,8 +30,9 @@ fn void? write_all(Conn conn, char[] data) @private
     }
 }
 
-<* Serialize an HTTP/1.1 request and write it to `conn`. Adds Host and
-   Connection: close, and Content-Length for a body unless the caller set one. *>
+<* Serialize an HTTP/1.1 request and write it to `conn`. Adds Host, Connection:
+   close, a default User-Agent, and Content-Length for a body — each only if the
+   caller did not already supply it. *>
 fn void? write_request(Allocator allocator, Conn conn, Method method, String host, String path, Header[] headers, char[] body) @private
 {
     DString req = dstring::new(allocator);
@@ -36,6 +41,7 @@ fn void? write_request(Allocator allocator, Conn conn, Method method, String hos
     req.appendf("%s %s HTTP/1.1\r\n", method.name, path)!;
     req.appendf("Host: %s\r\n", host)!;
     req.append_string("Connection: close\r\n");
+    if (find_header(headers, "User-Agent").len == 0) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
 
     bool has_content_length = false;
     foreach (h : headers)
@@ -50,3 +56,41 @@ fn void? write_request(Allocator allocator, Conn conn, Method method, String hos
 
     write_all(conn, req.str_view())!;
 }
+
+// ---- fluent builder --------------------------------------------------------
+
+<* A fluent request builder. Chain `header` / `body` / `timeout`, then `send`.
+   Holds up to MAX_HEADERS headers inline; extras are dropped. *>
+struct RequestBuilder
+{
+    Method   method;
+    String   url;
+    char[]   _body;
+    Duration _timeout;
+    Header[MAX_HEADERS] _headers;
+    usz      _count;
+}
+
+<* Begin a `method` request to `url` (must be http://). *>
+fn RequestBuilder request(Method method, String url) => { .method = method, .url = url };
+
+<* Append a header. *>
+fn RequestBuilder RequestBuilder.header(self, String name, String value)
+{
+    if (self._count < MAX_HEADERS)
+    {
+        self._headers[self._count] = { .name = (char[])name, .value = (char[])value };
+        self._count++;
+    }
+    return self;
+}
+
+<* Set the request body. *>
+fn RequestBuilder RequestBuilder.body(self, char[] body) { self._body = body; return self; }
+
+<* Set the connection timeout (0 = none). *>
+fn RequestBuilder RequestBuilder.timeout(self, Duration timeout) { self._timeout = timeout; return self; }
+
+<* Open a connection, send the request, and read the response. *>
+fn Response? RequestBuilder.send(self, Allocator allocator)
+    => request_url(allocator, self.method, self.url, self._headers[:self._count], self._body, self._timeout);

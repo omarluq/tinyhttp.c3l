@@ -1,10 +1,10 @@
 // Header type and helpers, shared with the parser.
 
 module tinyhttp;
-import tinyhttp::parser;
+import httpparser;
 
 // name/value header (name.len == 0 marks an obs-fold continuation line).
-alias Header = parser::Header;
+alias Header = httpparser::Header;
 
 // Case-insensitive equality. Accepts a raw char[] token (as the parser produces)
 // or a String, since String implicitly converts to char[].

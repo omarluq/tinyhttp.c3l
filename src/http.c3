@@ -3,8 +3,9 @@
 // "Connection: close" (read the whole response, then parse).
 
 module tinyhttp;
-import tinyhttp::parser;
+import httpparser;
 import std::net::url;
+import std::time;
 
 faultdef
     UNSUPPORTED_SCHEME,   // only http:// so far
@@ -39,9 +40,9 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
     defer catch alloc::free(allocator, raw.ptr);   // freed only if we bail out below
 
     // Parse the status line + headers.
-    parser::Header[MAX_RESPONSE_HEADERS] hstore;
-    parser::ResponseHead presp;
-    usz? consumed = parser::parse_response(raw, &presp, hstore[..], 0);
+    httpparser::Header[MAX_RESPONSE_HEADERS] hstore;
+    httpparser::Response presp;
+    usz? consumed = httpparser::parse_response(raw, &presp, hstore[..], 0);
     if (catch consumed) return MALFORMED_RESPONSE~;
 
     // Frame the body: chunked, Content-Length, or read-to-EOF.
@@ -49,9 +50,9 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
     char[] body;
     if (ci_eq(find_header(presp.headers, "Transfer-Encoding"), "chunked"))
     {
-        parser::ChunkedDecoder dec = { .consume_trailer = true };
+        httpparser::ChunkedDecoder dec = { .consume_trailer = true };
         usz bsz = rest.len;
-        if (catch parser::decode_chunked(&dec, rest, &bsz)) return MALFORMED_RESPONSE~;
+        if (catch httpparser::decode_chunked(&dec, rest, &bsz)) return MALFORMED_RESPONSE~;
         body = rest[:bsz];
     }
     else
@@ -90,7 +91,7 @@ fn Response? read_response(Allocator allocator, Conn conn) @private
 // ---- convenience wrappers (open a connection, send, close) ------------------
 
 <* Perform `method url` over a fresh connection. `url` must be http://. *>
-fn Response? request_url(Allocator allocator, Method method, String url, Header[] headers = {}, char[] body = {})
+fn Response? request_url(Allocator allocator, Method method, String url, Header[] headers = {}, char[] body = {}, Duration timeout = {})
 {
     Url u = url::parse(tmem, url)!;
     if (!ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
@@ -98,7 +99,7 @@ fn Response? request_url(Allocator allocator, Method method, String url, Header[
     String path = u.path.len != 0 ? u.path : "/";
     if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);
 
-    PlainConn conn = dial(u.host, port)!;
+    PlainConn conn = dial(u.host, port, timeout)!;
     defer (void)conn.close();
     return send(allocator, &conn, method, u.host, path, headers, body);
 }

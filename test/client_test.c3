@@ -1,5 +1,6 @@
 // Tests for the HTTP client core, driven by an in-process mock Conn (no network).
 module tinyhttp;
+import std::time;
 
 // A Conn that serves canned response bytes and records what was written.
 struct MockConn (Conn)
@@ -113,4 +114,41 @@ fn void test_send_malformed() @test
         resp.free();
         assert(false, "expected MALFORMED_RESPONSE");
     }
+}
+
+fn void test_default_user_agent() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+    assert(m.written.str_view().contains("User-Agent: tinyhttp/0.1\r\n"));
+}
+
+fn void test_user_agent_override() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+    Header[1] hdrs = { { .name = "User-Agent", .value = "custom/9" } };
+    Response resp = send(mem, &m, GET, "x", "/", hdrs[..])!!;
+    defer resp.free();
+    String req = m.written.str_view();
+    assert(req.contains("User-Agent: custom/9\r\n"));
+    assert(!req.contains("tinyhttp/0.1"));    // ours not added when overridden
+}
+
+fn void test_builder() @test
+{
+    RequestBuilder b = request(POST, "http://x/y")
+        .header("A", "1")
+        .header("B", "2")
+        .body("data")
+        .timeout(3 * time::SEC);
+    assert(b.method == POST);
+    assert(b.url == "http://x/y");
+    assert(b._count == 2);
+    assert(b._headers[0].name == "A");
+    assert(b._headers[1].value == "2");
+    assert(b._body == "data");
+    assert(b._timeout == 3 * time::SEC);
 }

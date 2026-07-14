@@ -1,6 +1,6 @@
 // Tests for the parser. Mirrors cases from the upstream picotest suite
 // (t/00picohttpparser.c).
-module tinyhttp::parser;
+module httpparser;
 
 // Compare a parsed slice against an expected string.
 fn bool seq(char[] a, String b) @local => a == (char[])b;
@@ -27,7 +27,7 @@ macro @assert_fault(#call, fault want) @local
 fn void test_request_simple() @test
 {
     String req = "GET / HTTP/1.0\r\n\r\n";
-    RequestHead r;
+    Request r;
     Header[8] hdrs;
     @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
     assert(seq(r.method, "GET"));
@@ -39,7 +39,7 @@ fn void test_request_simple() @test
 fn void test_request_headers() @test
 {
     String req = "GET /hi HTTP/1.1\r\nHost: example.com\r\nCookie: \r\n\r\n";
-    RequestHead r;
+    Request r;
     Header[8] hdrs;
     @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
     assert(seq(r.method, "GET"));
@@ -55,7 +55,7 @@ fn void test_request_headers() @test
 fn void test_request_multiple_spaces() @test
 {
     String req = "GET   /   HTTP/1.0\r\n\r\n";
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
     assert(seq(r.method, "GET"));
@@ -66,7 +66,7 @@ fn void test_request_trailing_ws_trim() @test
 {
     // Trailing SP/HTAB in a value are stripped; internal ones kept.
     String req = "GET / HTTP/1.0\r\nH: a b  \t \r\n\r\n";
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
     assert(r.headers.len == 1);
@@ -78,7 +78,7 @@ fn void test_request_multiline_continuation() @test
 {
     // Obs-fold continuation line has a zero-length header name.
     String req = "GET / HTTP/1.0\r\nFoo: ab\r\n bc\r\n\r\n";
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     @assert_ok(parse_request(req, &r, hdrs[..], 0), req.len);
     assert(r.headers.len == 2);
@@ -91,7 +91,7 @@ fn void test_request_multiline_continuation() @test
 
 fn void test_request_partial() @test
 {
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     @assert_fault(parse_request("GET / HTTP/1.0\r\n\r", &r, hdrs[..], 0), INCOMPLETE);
     @assert_fault(parse_request("", &r, hdrs[..], 0), INCOMPLETE);
@@ -101,7 +101,7 @@ fn void test_request_partial() @test
 
 fn void test_request_invalid() @test
 {
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     @assert_fault(parse_request("GET / HTXP/1.0\r\n\r\n", &r, hdrs[..], 0), MALFORMED);   // bad version
     @assert_fault(parse_request("GET / HTTP/1.0\r\n: v\r\n\r\n", &r, hdrs[..], 0), MALFORMED); // empty name
@@ -111,7 +111,7 @@ fn void test_request_invalid() @test
 
 fn void test_request_slowloris() @test
 {
-    RequestHead r;
+    Request r;
     Header[4] hdrs;
     // last_len != 0 triggers the incremental completeness check.
     String p = "GET / HTTP/1.0\r\nHost: x\r\n";
@@ -126,7 +126,7 @@ fn void test_request_slowloris() @test
 fn void test_response_simple() @test
 {
     String resp = "HTTP/1.1 200 OK\r\n\r\n";
-    ResponseHead r;
+    Response r;
     Header[8] hdrs;
     @assert_ok(parse_response(resp, &r, hdrs[..], 0), resp.len);
     assert(r.minor_version == 1);
@@ -138,7 +138,7 @@ fn void test_response_simple() @test
 fn void test_response_headers_and_long_msg() @test
 {
     String resp = "HTTP/1.0 500 Internal Server Error\r\nX-Y: z\r\n\r\n";
-    ResponseHead r;
+    Response r;
     Header[8] hdrs;
     @assert_ok(parse_response(resp, &r, hdrs[..], 0), resp.len);
     assert(r.status == 500);
@@ -151,7 +151,7 @@ fn void test_response_headers_and_long_msg() @test
 fn void test_response_empty_msg() @test
 {
     String resp = "HTTP/1.1 200 \r\n\r\n";
-    ResponseHead r;
+    Response r;
     Header[4] hdrs;
     @assert_ok(parse_response(resp, &r, hdrs[..], 0), resp.len);
     assert(r.status == 200);
@@ -160,7 +160,7 @@ fn void test_response_empty_msg() @test
 
 fn void test_response_partial_and_invalid() @test
 {
-    ResponseHead r;
+    Response r;
     Header[4] hdrs;
     @assert_fault(parse_response("HTTP/1.1 200 OK\r\n", &r, hdrs[..], 0), INCOMPLETE);
     @assert_fault(parse_response("HTTP/1.1 2", &r, hdrs[..], 0), INCOMPLETE);

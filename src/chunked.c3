@@ -1,7 +1,7 @@
 // An idiomatic C3 reimplementation of picohttpparser's chunked transfer-encoding
 // decoder. Upstream: https://github.com/h2o/picohttpparser (see parser.c3).
 
-module tinyhttp::parser;
+module httpparser;
 
 enum ChunkedState : char @private
 {
