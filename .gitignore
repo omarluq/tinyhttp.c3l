@@ -1,0 +1,22 @@
+# c3c build output
+/obj/
+/build/
+testrun
+*.o
+*.obj
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# mbedTLS headers/source, used only to (re)build the TLS shim locally via
+# csrc/build-shim.sh. NOT part of the library: the shim is precompiled into
+# linked-libs/<target>/libtinyhttp_tls.a, so consumers link binaries only.
+csrc/mbedtls/
+
+# Committed on purpose (vendored binaries + shim source) — do NOT ignore, and do
+# NOT add a blanket *.a rule (it would exclude these):
+#   linked-libs/<target>/*.a          (mbedTLS + shim static archives)
+#   csrc/tls_shim.{c,h}, csrc/build-shim.sh
