@@ -24,15 +24,15 @@ enum Method : char (String name)
    did not already supply them; Connection: close is always sent (the read path
    reads to EOF and needs it). Caller header names/values containing CR or LF
    fault with INVALID_HEADER. *>
-fn void? write_request(Allocator allocator, Conn conn, Method method, String host, String path, Header[] headers, char[] body) @private
+fn void? write_request(Conn conn, Method method, String host, String path, Header[] headers, char[] body) @private
 {
-    DString req = dstring::new_with_capacity(allocator, 256);
+    DString req = dstring::temp_with_capacity(256);
     defer req.free();
 
     req.appendf("%s %s HTTP/1.1\r\n", method.name, path)!;
-    if (find_header(headers, "Host").len == 0) req.appendf("Host: %s\r\n", host)!;
+    if (!has_header(headers, "Host")) req.appendf("Host: %s\r\n", host)!;
     req.append_string("Connection: close\r\n");
-    if (find_header(headers, "User-Agent").len == 0) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
+    if (!has_header(headers, "User-Agent")) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
 
     bool has_content_length = false;
     foreach (h : headers)
@@ -40,6 +40,7 @@ fn void? write_request(Allocator allocator, Conn conn, Method method, String hos
         String hname = (String)h.name;
         String hvalue = (String)h.value;
         if (hname.contains("\r") || hname.contains("\n") || hvalue.contains("\r") || hvalue.contains("\n")) return INVALID_HEADER~;
+        if (ci_eq(h.name, "Connection")) continue;
         req.appendf("%s: %s\r\n", hname, hvalue)!;
         if (ci_eq(h.name, "Content-Length")) has_content_length = true;
     }
@@ -67,7 +68,10 @@ struct RequestBuilder
     bool     _overflow;
 }
 
-<* Begin a `method` request to `url` (must be http://). *>
+<* Begin a `method` request to `url` (must be http://). Returns an UNSENT
+   RequestBuilder: chain `.header()` / `.body()` / `.timeout()`, then call
+   `.send()` to execute — unlike `Client.request` / `request_url`, no I/O
+   happens here. *>
 fn RequestBuilder request(Method method, String url) => { .method = method, .url = url };
 
 <* Append a header. Returns the builder for chaining. Beyond MAX_HEADERS the

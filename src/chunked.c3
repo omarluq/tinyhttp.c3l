@@ -170,7 +170,7 @@ fn usz? decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
     }
 
     // Broke out of the loop: incomplete. If the framing overhead is >= 100 KB and
-    // more than 80% of the stream, treat it as an attack and fail.
+    // more than 75% of the stream, treat it as an attack and fail.
     decoder._total_overhead += size - dst;
     if (decoder._total_overhead >= 100 * 1024 &&
         decoder._total_read - decoder._total_overhead < decoder._total_read / 4)

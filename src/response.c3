@@ -24,11 +24,7 @@ fn String Response.header(&self, String name) => find_header(self.headers, name)
 <* True if a header named `name` is present (case-insensitive), even when its
    value is empty. Distinguishes absent from present-but-empty, which
    `header` (empty-string sentinel) cannot. *>
-fn bool Response.has_header(&self, String name)
-{
-    foreach (&h : self.headers) if (ci_eq(h.name, name)) return true;
-    return false;
-}
+fn bool Response.has_header(&self, String name) => has_header(self.headers, name);
 
 <* Free the backing buffer and header array. Idempotent (null-safe + self-reset). *>
 fn void Response.free(&self)

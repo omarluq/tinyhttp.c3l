@@ -26,10 +26,10 @@ fn Client client(Allocator allocator, String base_url = "", Header[] default_hea
    would not all fit. Returns the new count. *>
 fn usz? append_headers(Header[] dst, usz count, Header[] src) @private
 {
-    foreach (h : src)
+    foreach (&h : src)
     {
         if (count >= dst.len) return TOO_MANY_HEADERS~;
-        dst[count] = h;
+        dst[count] = *h;
         count++;
     }
     return count;
@@ -42,13 +42,13 @@ fn usz? append_headers(Header[] dst, usz count, Header[] src) @private
 fn usz? merge_headers(Header[] dst, Header[] defaults, Header[] overrides) @private
 {
     usz m = 0;
-    foreach (h : defaults)
+    foreach (&h : defaults)
     {
         bool overridden = false;
-        foreach (c : overrides) if (ci_eq(h.name, (String)c.name)) { overridden = true; break; }
+        foreach (&c : overrides) if (ci_eq(h.name, (String)c.name)) { overridden = true; break; }
         if (overridden) continue;
         if (m >= dst.len) return TOO_MANY_HEADERS~;
-        dst[m++] = h;
+        dst[m++] = *h;
     }
     return append_headers(dst, m, overrides);
 }

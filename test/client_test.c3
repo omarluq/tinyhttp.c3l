@@ -327,3 +327,114 @@ fn void test_response_has_header() @test
     assert(r.header("X-Empty").len == 0);      // header() cannot distinguish absent from empty
     assert(r.header("X-Absent").len == 0);
 }
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+fn usz count_occurrences(String hay, String needle) @local
+{
+    if (needle.len == 0 || hay.len < needle.len) return 0;
+    usz n = 0;
+    for (usz i = 0; i + needle.len <= hay.len; i++)
+    {
+        if (hay[i:needle.len] == needle) n++;
+    }
+    return n;
+}
+
+// R1: a caller Connection: keep-alive is dropped; only the always-emitted
+// Connection: close reaches the wire.
+fn void test_caller_keep_alive_suppressed() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+
+    Header[1] h = { { .name = "Connection", .value = "keep-alive" } };
+    Response resp = send(mem, &m, GET, "x", "/", h[..])!!;
+    defer resp.free();
+
+    String req = m.written.str_view();
+    assert(req.contains("Connection: close\r\n"));
+    assert(!req.contains("keep-alive"));
+}
+
+// R2: HEAD carries no body even when headers advertise Content-Length; the
+// bodiless short-circuit succeeds instead of faulting INCOMPLETE_RESPONSE.
+fn void test_head_bodiless() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, HEAD, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 200);
+    assert(resp.body.len == 0);
+}
+
+// R2: a 204 No Content response is bodiless.
+fn void test_status_204_bodiless() @test
+{
+    MockConn m = mock("HTTP/1.1 204 No Content\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 204);
+    assert(resp.body.len == 0);
+}
+
+// R2: a 304 Not Modified response is bodiless.
+fn void test_status_304_bodiless() @test
+{
+    MockConn m = mock("HTTP/1.1 304 Not Modified\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 304);
+    assert(resp.body.len == 0);
+}
+
+// R2: a Content-Length larger than the bytes actually received faults
+// INCOMPLETE_RESPONSE.
+fn void test_short_content_length_faults() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
+    defer m.written.free();
+
+    if (try resp = send(mem, &m, GET, "x", "/"))
+    {
+        resp.free();
+        assert(false, "expected INCOMPLETE_RESPONSE");
+    }
+}
+
+// R4: a present-but-empty caller Host suppresses the auto Host, so exactly one
+// Host line reaches the wire and the send host arg is not added on top.
+fn void test_empty_host_not_duplicated() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+
+    Header[1] h = { { .name = "Host", .value = "" } };
+    Response resp = send(mem, &m, GET, "x", "/", h[..])!!;
+    defer resp.free();
+
+    String req = m.written.str_view();
+    assert(count_occurrences(req, "Host:") == 1);
+    assert(!req.contains("Host: x"));
+}
+
+// R5: two separate Transfer-Encoding lines are one comma list; the final
+// transfer-coding across all of them is chunked, so the body de-chunks.
+fn void test_multi_line_transfer_encoding_chunked() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.body == "abc");
+}

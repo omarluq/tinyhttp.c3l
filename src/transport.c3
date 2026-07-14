@@ -6,7 +6,14 @@ module tinyhttp;
 import std::io;
 import std::net;
 import std::net::tcp;
+import std::net::os;
 import std::time;
+
+// R12: disable Nagle's algorithm so small request writes go out immediately.
+// The os module only defines these in its no-libc fallback (compiled out on real
+// platforms), so both socket-option constants are declared locally to stay portable.
+const CInt TCP_LEVEL_IPPROTO_TCP @private = 6;
+const CInt TCP_OPT_NODELAY @private = 1;
 
 <* A blocking byte transport built on the stdlib stream interfaces:
    `read`/`write` move bytes (0 from `read` == peer closed) or fault;
@@ -45,5 +52,9 @@ fn PlainConn? dial(String host, int port, Duration timeout = time::DURATION_ZERO
             default:                        return CONNECT_FAILED~;
         }
     }
+    // R12: best-effort TCP_NODELAY; failure to tune is non-fatal, so the CInt
+    // result is intentionally discarded.
+    CInt nodelay = 1;
+    (void)os::setsockopt(sock.sock, TCP_LEVEL_IPPROTO_TCP, TCP_OPT_NODELAY, &nodelay, CInt::size);
     return { .sock = sock };
 }
