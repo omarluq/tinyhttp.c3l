@@ -143,6 +143,14 @@ fn SslCtx? make_ctx(TlsConfig config) @private
     return ctx;
 }
 
+<* Free a shared `SSL_CTX` built by `make_ctx`, tolerating null. Mirrors `make_ctx`
+   so the raw OpenSSL teardown stays confined to this transport file; the caller
+   invokes it once every SSL layered over the ctx is gone. *>
+fn void free_shared_ctx(SslCtx ctx) @private
+{
+    if (ctx != null) ssl_ctx_free(ctx);
+}
+
 <* If `host` is an IP literal, return the bare IP text (IPv6 brackets stripped) for
    `X509_VERIFY_PARAM_set1_ip_asc`; otherwise fault. Lets `dial_tls_ctx` verify an
    `https://<ip>/` peer against the certificate's iPAddress SAN rather than a

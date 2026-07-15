@@ -126,7 +126,8 @@ fn void Client.close(&self)
     // Free pooled sockets first, then the shared ctx AFTER, so it outlives every
     // SSL layered over it.
     self.pool.free();
-    if (self.tls_ctx != null) { ssl_ctx_free(self.tls_ctx); self.tls_ctx = (SslCtx)null; }
+    free_shared_ctx(self.tls_ctx);
+    self.tls_ctx = (SslCtx)null;
 }
 
 <* Compose the transient pool key "scheme|host|port". The key lives in `tmem`;
