@@ -191,16 +191,19 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
                 }
             }
             w.ensure_capacity(w.index + 4096)!;
+            // Both failure arms below observe the same unchanged w.index, so decide the
+            // stale-keep-alive guard once: an idle reused conn closed before any byte arrived.
+            bool stale = reused && interim == 0 && w.index == 0;
             sz? nr = read_into(conn, &w, &received);
             if (catch e = nr)
             {
-                if (reused && interim == 0 && w.index == 0) return STALE_CONNECTION~;   // idle keep-alive conn was closed
+                if (stale) return STALE_CONNECTION~;   // idle keep-alive conn was closed
                 return e~;
             }
             sz n = nr;
             if (n == 0)
             {
-                if (reused && interim == 0 && w.index == 0) return STALE_CONNECTION~;
+                if (stale) return STALE_CONNECTION~;
                 return MALFORMED_RESPONSE~;                             // EOF before a complete header block
             }
         }
