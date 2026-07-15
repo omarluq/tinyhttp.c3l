@@ -181,7 +181,7 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Duratio
     else
     {
         ZString host_z = host.zstr_tcopy();
-        ssl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, (void*)host_z);   // SNI
+        if (ssl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, (void*)host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // SNI
         if (verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // hostname check
     }
 
