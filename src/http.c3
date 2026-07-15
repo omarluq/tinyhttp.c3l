@@ -226,9 +226,6 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
             }
         }
     }
-    bool resp_close = has_connection_token(presp.headers, "close");
-    bool resp_keepalive = has_connection_token(presp.headers, "keep-alive");
-    int minor_version = presp.minor_version;
 
     // PHASE 2: consume exactly the framed body, dispatching to the matching strategy.
     // Each helper leaves w.index at consumed + body_len and returns the body length plus
@@ -283,8 +280,12 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     // (leftover > 0 means unframed data we can't push back into the socket).
     if (reusable != null)
     {
+        // Header bytes are never mutated after phase 1, so presp2 yields the same
+        // Connection tokens and minor version as the phase-1 parse would.
+        bool resp_close = has_connection_token(presp2.headers, "close");
+        bool resp_keepalive = has_connection_token(presp2.headers, "keep-alive");
         bool delimited = bodiless || content_length >= 0 || is_chunked;
-        bool persistent = minor_version >= 1 ? !resp_close : resp_keepalive;
+        bool persistent = presp2.minor_version >= 1 ? !resp_close : resp_keepalive;
         *reusable = delimited && persistent && leftover == 0;
     }
 
