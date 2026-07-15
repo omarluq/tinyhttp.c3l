@@ -13,8 +13,6 @@
 module tinyhttp;
 import httpparser;
 import std::io;
-import std::net::url;
-import std::time;
 
 faultdef
     UNSUPPORTED_SCHEME,   // scheme is neither http:// nor https://
@@ -345,68 +343,3 @@ fn Response? do_exchange(Allocator allocator, Conn conn, Method method, String h
     *reusable = resp_reusable && !has_connection_close(headers);
     return resp;
 }
-
-// ---- convenience wrappers (open a connection, send, close) ------------------
-
-<* The resolved pieces of a request URL: the connect `Url`, the RFC 7230 §5.4
-   Host header value, the request-target, the resolved connect port and whether
-   the scheme is https. *>
-struct RequestTarget @private
-{
-    Url    url;
-    String host_hdr;
-    String target;
-    int    port;
-    bool   is_https;
-}
-
-<* Parse `url_str` (must be http:// or https://) into a `RequestTarget`: the connect
-   `Url`, the RFC 7230 §5.4 Host header value (host, plus non-default port), the
-   request-target (percent-re-encoded path + raw query), the resolved connect port
-   (explicit port, else the scheme default) and the is_https flag. *>
-fn RequestTarget? make_request_target(String url_str) @private
-{
-    Url u = url::parse(tmem, url_str) ?? INVALID_URL~!;   // maps url faults (incl. EMPTY on "") to INVALID_URL
-    bool is_https = ci_eq(u.scheme, "https");
-    if (!is_https && !ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
-    int default_port = is_https ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT;
-    int port = u.port ?: default_port;
-    String host_hdr = port == default_port ? u.host : string::tformat("%s:%d", u.host, port);
-    String path = u.path.len != 0 ? url::tencode(u.path, url::UrlEncodingMode.PATH) : "/";  // re-encode path
-    if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);                   // query left un-decoded by url::parse
-    return { .url = u, .host_hdr = host_hdr, .target = path, .port = port, .is_https = is_https };
-}
-
-<* Perform `method url_str` over a fresh connection. `url_str` must be http:// or https://. *>
-fn Response? request_url(Method method, String url_str, Header[] headers = {}, char[] body = {}, Duration timeout = time::DURATION_ZERO, Allocator allocator = tmem, TlsConfig tls = {})
-{
-    RequestTarget rt = make_request_target(url_str)!;
-    if (rt.is_https)
-    {
-        TlsConn conn = dial_tls(rt.url.host, rt.port, tls, timeout)!;
-        defer (void)conn.close();
-        return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
-    }
-    PlainConn conn = dial(rt.url.host, rt.port, timeout)!;
-    defer (void)conn.close();
-    return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
-}
-
-<* Perform `GET url` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? get(String url, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(GET, url, headers, allocator: allocator);
-<* Perform `HEAD url` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? head(String url, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(HEAD, url, headers, allocator: allocator);
-<* Perform `DELETE url` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? delete(String url, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(DELETE, url, headers, allocator: allocator);
-<* Perform `POST url` with `body` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? post(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(POST, url, headers, body, allocator: allocator);
-<* Perform `PUT url` with `body` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? put(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(PUT, url, headers, body, allocator: allocator);
-<* Perform `PATCH url` with `body` over a fresh connection. `url` must be http:// or https://. *>
-fn Response? patch(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
-    => request_url(PATCH, url, headers, body, allocator: allocator);
