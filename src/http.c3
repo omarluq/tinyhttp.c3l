@@ -77,9 +77,14 @@ struct BodyFrame @private
 fn BodyFrame? read_body_content_length(Conn conn, ByteWriter* w, usz consumed, usz content_length, usz* received) @private
 {
     usz have = (usz)w.index - consumed;
+    usz target = consumed + content_length;
     while (have < content_length)
     {
-        w.ensure_capacity((sz)(consumed + content_length))!;
+        // Grow to a bounded read-ahead window, never past the declared total, so memory
+        // tracks bytes actually delivered rather than reserving the full (possibly near-cap)
+        // Content-Length up front on the first byte.
+        usz want = (usz)w.index + 65536;
+        w.ensure_capacity((sz)(want < target ? want : target))!;
         sz? nr = read_into(conn, w, received);   // read into the spare capacity
         if (catch e = nr) return e~;
         sz n = nr;

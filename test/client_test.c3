@@ -318,6 +318,31 @@ fn void test_content_length_declared_cap() @test
     assert(false, "over-cap Content-Length should be rejected");
 }
 
+// Issue #5: a Content-Length body larger than the 64 KiB read-ahead window is
+// assembled correctly across the multiple grow-and-read passes the bounded window
+// now forces (the buffer is grown toward the declared total in windowed steps
+// rather than reserved all at once on the first byte).
+fn void test_large_content_length_windowed() @test
+{
+    const usz BODY = 200_000;   // > 3x the 65536 read-ahead window
+    DString raw = dstring::new(mem);
+    defer raw.free();
+    raw.appendf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", BODY);
+    for (usz i = 0; i < BODY; i++) raw.append_char('a' + (char)(i % 26));
+
+    MockConn m = mock(raw.str_view());
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 200);
+    assert(resp.body.len == BODY);
+    assert(resp.body[0] == 'a');
+    assert(resp.body[25] == 'z');
+    assert(resp.body[BODY - 1] == 'a' + (char)((BODY - 1) % 26));
+}
+
 // Issue #2: two Content-Length fields with DIFFERING values are unrecoverable
 // (RFC 7230 §3.3.3 rule 4). Framing on the first value alone would read 10 bytes
 // and buffer the rest as leftover — a response-smuggling primitive — so this
