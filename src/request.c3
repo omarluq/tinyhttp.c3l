@@ -19,6 +19,8 @@ enum Method : char (String name)
     OPTIONS { "OPTIONS" },
 }
 
+fn bool has_crlf(String s) @private => s.contains_char('\r') || s.contains_char('\n');
+
 <* Serialize an HTTP/1.1 request and write it to `conn`. Host, a default
    User-Agent, and Content-Length for a body are each added only if the caller
    did not already supply them. Connection: close is sent only when `close` is
@@ -40,7 +42,7 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
     {
         String hname = (String)h.name;
         String hvalue = (String)h.value;
-        if (hname.contains("\r") || hname.contains("\n") || hvalue.contains("\r") || hvalue.contains("\n")) return INVALID_HEADER~;
+        if (has_crlf(hname) || has_crlf(hvalue)) return INVALID_HEADER~;
         if (ci_eq(h.name, "Connection")) continue;
         req.appendf("%s: %s\r\n", hname, hvalue)!;
         if (ci_eq(h.name, "Content-Length")) has_content_length = true;
