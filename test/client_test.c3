@@ -897,6 +897,39 @@ fn void test_client_pool_reuse() @test
     c.close();            // drains the pool: closes + frees the pooled conn and its key
 }
 
+// K12b: a base_url that carries a path prefix keeps prepending it to each request
+// path across calls, and the pool key stays scheme|host|port. The cached-target
+// fast path must reproduce the same request-target as parsing base_url + path
+// would; both calls ride one pooled conn keyed "http|x|80" and emit
+// "GET /api/users HTTP/1.1".
+fn void test_client_pool_reuse_base_path() @test
+{
+    String[2] resps = {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld",
+    };
+    SeqConn* m = alloc::new(mem, SeqConn);
+    m.responses = resps[..];
+    m.written = dstring::new(mem);
+
+    Client c = client(mem, "http://x/api");
+    c.pool.checkin(pool_key("http", "x", 80), { .conn = (Conn)m, .mem = m });
+
+    Response r1 = c.request(GET, "/users")!!;
+    defer r1.free();
+    assert(r1.body == "hello");
+
+    Response r2 = c.request(GET, "/users")!!;
+    defer r2.free();
+    assert(r2.body == "world");
+
+    // base_url path "/api" prepends to "/users" on every call -> "/api/users".
+    assert(count_occurrences(m.written.str_view(), "GET /api/users HTTP/1.1\r\n") == 2);
+
+    m.written.free();
+    c.close();
+}
+
 // K13: a reused idle conn found dead (first read is EOF) surfaces STALE_CONNECTION
 // so the caller can retry; the fault carries the internal retry signal.
 fn void test_stale_connection_detected() @test

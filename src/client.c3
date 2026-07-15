@@ -20,6 +20,22 @@ struct Client
     TlsConfig tls;          // applied to https:// requests (default: verify vs the system CA bundle)
     ConnPool  pool;         // keep-alive pool of idle connections, keyed by scheme|host|port
     SslCtx    tls_ctx;      // shared long-lived SSL_CTX for https dials, built lazily on first use
+
+    // Lazily-cached connection target for a non-empty base_url: base_url fixes the
+    // scheme/host/port/host-header/pool-key (only the request-target varies per
+    // call), so these are computed once on the first request rather than reparsed
+    // every call. Cached at first use, not construction, because client() is
+    // infallible while url::parse can fault. The strings live on `allocator` and
+    // are released by close(). `base_target_prefix` is "http://h" + base_url's
+    // authority-stripped remainder, so the per-call target is derived by
+    // re-parsing only that short prefix + path (never base_url's origin again).
+    bool   base_cached;
+    bool   base_https;
+    String base_host;
+    int    base_port;
+    String base_host_hdr;
+    String base_key;
+    String base_target_prefix;
 }
 
 <* Create a client. *>
@@ -66,22 +82,48 @@ fn usz? merge_headers(Header[] dst, Header[] defaults, Header[] overrides) @priv
    it. Call `close` when done to release pooled sockets. *>
 fn Response? Client.request(&self, Method method, String path, Header[] headers = {}, char[] body = {}) => @pool()
 {
-    // Reset the per-request transient churn (url parse, host/target formatting,
-    // pool key) on every exit path; everything that outlives the call lives on
-    // self.allocator.
-    String url = self.base_url.len != 0 ? self.base_url.tconcat(path) : path;
-
+    // Merge headers first so a header overflow faults before any per-Client cache
+    // is populated (nothing persistent is allocated on the way out).
     Header[MAX_HEADERS] merged;
     usz m = merge_headers(merged[..], self.default_headers, headers)!;
 
-    RequestTarget rt = make_request_target(url)!;
-    String scheme = rt.is_https ? "https" : "http";
-    String key = pool_key(scheme, rt.url.host, rt.port);
+    bool   is_https;
+    String host;
+    int    port;
+    String host_hdr;
+    String key;
+    String target;
+    if (self.base_url.len != 0)
+    {
+        // Non-empty base_url: scheme/host/port/host-header/pool-key are invariant,
+        // cached once (self.allocator). Only the request-target varies per call, and
+        // it is built by re-parsing just the cached authority-stripped prefix + path
+        // — base_url's origin is never reparsed after the first request.
+        self.ensure_base_cached()!;
+        is_https = self.base_https;
+        host     = self.base_host;
+        port     = self.base_port;
+        host_hdr = self.base_host_hdr;
+        key      = self.base_key;
+        target   = make_request_target(self.base_target_prefix.tconcat(path))!.target;
+    }
+    else
+    {
+        // Empty base_url: `path` is a full absolute URL parsed per call; everything
+        // here lives in tmem and is reset on every exit path.
+        RequestTarget rt = make_request_target(path)!;
+        is_https = rt.is_https;
+        host     = rt.url.host;
+        port     = rt.port;
+        host_hdr = rt.host_hdr;
+        target   = rt.target;
+        key      = pool_key(rt.is_https ? "https" : "http", rt.url.host, rt.port);
+    }
 
     // Pooled attempt: reuse an idle connection if one is available.
     if (try ic = self.pool.checkout(key))
     {
-        Response? r = self.exchange_and_settle(key, ic, method, rt.host_hdr, rt.target, merged[:m], body, true);
+        Response? r = self.exchange_and_settle(key, ic, method, host_hdr, target, merged[:m], body, true);
         // On a real fault the socket is already discarded; only a stale idle
         // socket falls through to a fresh dial.
         if (catch e = r)
@@ -95,8 +137,41 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     }
 
     // Fresh connection (also the stale-retry path; reused:false, so STALE_CONNECTION cannot arise here).
-    IdleConn ic = self.dial_idle(rt.is_https, rt.url.host, rt.port)!;
-    return self.exchange_and_settle(key, ic, method, rt.host_hdr, rt.target, merged[:m], body, false);
+    IdleConn ic = self.dial_idle(is_https, host, port)!;
+    return self.exchange_and_settle(key, ic, method, host_hdr, target, merged[:m], body, false);
+}
+
+<* Populate the per-Client cache of connection invariants for a non-empty
+   `base_url` on first use: scheme/host/port/host-header/pool-key (all constant
+   for the Client's life) plus `base_target_prefix` ("http://h" + base_url's
+   authority-stripped remainder) so later calls re-parse only that short prefix +
+   path. Copies live on `self.allocator` and are released by close(). Raises
+   INVALID_URL/UNSUPPORTED_SCHEME if base_url does not parse. *>
+fn void? Client.ensure_base_cached(&self) @private
+{
+    if (self.base_cached) return;
+    RequestTarget rt = make_request_target(self.base_url)!;
+    self.base_https         = rt.is_https;
+    self.base_host          = rt.url.host.copy(self.allocator);
+    self.base_port          = rt.port;
+    self.base_host_hdr      = rt.host_hdr.copy(self.allocator);
+    self.base_key           = pool_key(rt.is_https ? "https" : "http", rt.url.host, rt.port).copy(self.allocator);
+    self.base_target_prefix = ("http://h").concat(self.allocator, base_authority_rest(self.base_url));
+    self.base_cached        = true;
+}
+
+<* The authority-stripped remainder of `url_str` (everything from the first '/',
+   '?' or '#' after "scheme://" to the end, or "" if the authority is the whole
+   rest). Prepending a dummy authority to `rest` + path reproduces the request
+   target that parsing base_url + path would yield, without reparsing base_url's
+   origin. *>
+fn String base_authority_rest(String url_str) @private
+{
+    usz start = 0;
+    if (try i = url_str.index_of("://")) start = (usz)i + 3;
+    String after = url_str[start..];
+    sz rel = after.index_of_chars("/?#") ?? (sz)after.len;
+    return after[(usz)rel..];
 }
 
 <* Run one request/response exchange on `ic` and settle its pool membership:
@@ -128,6 +203,15 @@ fn void Client.close(&self)
     self.pool.free();
     free_shared_ctx(self.tls_ctx);
     self.tls_ctx = (SslCtx)null;
+    // Release the base_url cache copies made on first request (if any).
+    if (self.base_cached)
+    {
+        alloc::free(self.allocator, self.base_host.ptr);
+        alloc::free(self.allocator, self.base_host_hdr.ptr);
+        alloc::free(self.allocator, self.base_key.ptr);
+        alloc::free(self.allocator, self.base_target_prefix.ptr);
+        self.base_cached = false;
+    }
 }
 
 <* Compose the transient pool key "scheme|host|port". The key lives in `tmem`;
