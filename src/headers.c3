@@ -78,7 +78,7 @@ fn bool has_connection_token(Header[] headers, String token) @private
 // True if any Connection header carries the "close" token.
 fn bool has_connection_close(Header[] headers) @private => has_connection_token(headers, "close");
 
-// R5 + R14: chunked iff the FINAL transfer-coding across ALL Transfer-Encoding
+// chunked iff the FINAL transfer-coding across ALL Transfer-Encoding
 // header lines is chunked (multiple TE headers == one comma list; last one wins).
 // An absent header leaves te empty, and an empty te provably yields false.
 fn bool te_is_chunked(Header[] headers) @private

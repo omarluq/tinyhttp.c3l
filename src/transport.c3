@@ -9,7 +9,7 @@ import std::net::tcp;
 import std::net::os;
 import std::time;
 
-// R12: disable Nagle's algorithm so small request writes go out immediately.
+// disable Nagle's algorithm so small request writes go out immediately.
 // std::net::os exposes IPPROTO_TCP only in its no-libc fallback and does not expose
 // a TCP_NODELAY constant at all, so both are declared locally.
 const CInt IPPROTO_TCP @private = 6;
@@ -52,7 +52,7 @@ fn PlainConn? dial(String host, int port, Duration timeout = time::DURATION_ZERO
             default:                        return CONNECT_FAILED~;
         }
     }
-    // R12: best-effort TCP_NODELAY; failure to tune is non-fatal, so the CInt
+    // best-effort TCP_NODELAY; failure to tune is non-fatal, so the CInt
     // result is intentionally discarded.
     CInt nodelay = 1;
     (void)os::setsockopt(sock.sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, CInt::size);

@@ -1,6 +1,6 @@
 // A reusable HTTP client: a base URL, default headers, and a connection timeout,
 // applied to every request. Client.request reuses connections through a
-// keep-alive pool (Increment 4); the convenience wrappers stay one-shot.
+// keep-alive pool; the convenience wrappers stay one-shot.
 
 module tinyhttp;
 import std::net::url;

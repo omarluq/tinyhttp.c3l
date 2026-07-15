@@ -3,7 +3,7 @@
 // RFC 7230) so a keep-alive connection can be reused; only a close-delimited
 // body (no Content-Length, not chunked) is read to EOF.
 //
-// Allocation model (R9): callers pass a single Allocator that owns the
+// Allocation model: callers pass a single Allocator that owns the
 // Response. Internally this module uses a two-tier scheme: transient work
 // (URL parsing, Host/target formatting) goes through `tmem`, while everything
 // the returned Response points at (the raw response buffer and the owned
@@ -148,7 +148,7 @@ fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* rece
    delimited, neither side asked to close, and no trailing bytes remain. *>
 fn Response? read_response(Allocator allocator, Conn conn, Method method, bool reused = false, bool* reusable = null) @private
 {
-    // R11: read straight into the ByteWriter's spare capacity (no stack chunk + second memcpy).
+    // read straight into the ByteWriter's spare capacity (no stack chunk + second memcpy).
     ByteWriter w;
     w.init(allocator);
     defer catch (void)w.destroy();   // frees the buffer on any fault exit; on success Response owns it
@@ -224,7 +224,7 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
 
     // Framing SCALARS from the phase-1 parse. Header token slices are invalidated by
     // later buffer growth, so capture values (never slices) now.
-    // R2: RFC 7230 §3.3.3 — HEAD, 1xx, 204, 304 carry no body regardless of framing headers.
+    // RFC 7230 §3.3.3 — HEAD, 1xx, 204, 304 carry no body regardless of framing headers.
     bool bodiless = method == HEAD
         || (presp.status >= 100 && presp.status < 200)
         || presp.status == 204
@@ -275,7 +275,7 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     usz body_len = frame.body_len;
     usz leftover = frame.leftover;
 
-    // PHASE 3 (R13): shrink the power-of-two over-allocation, keeping w.bytes in sync so
+    // PHASE 3: shrink the power-of-two over-allocation, keeping w.bytes in sync so
     // the defer-catch frees the right (possibly moved) pointer and every slice derives from it.
     char[] raw = w.array_view();   // .ptr == allocation base; Response.free frees it
     if (w.bytes.len > w.index)
