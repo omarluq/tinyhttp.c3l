@@ -240,7 +240,7 @@ fn void test_user_agent_override() @test
 
 fn void test_builder() @test
 {
-    RequestBuilder b = new_request(POST, "http://x/y");
+    RequestBuilder b = request(POST, "http://x/y");
     b.header("A", "1").header("B", "2").body("data").timeout(3 * time::SEC)
         .tls({ .no_verify = true, .ca_file = "/etc/ca.pem" });
     assert(b.method == POST);
@@ -254,7 +254,7 @@ fn void test_builder() @test
     assert(b._tls.ca_file == "/etc/ca.pem");
 
     // Default builder keeps verification on (TlsConfig{}).
-    RequestBuilder d = new_request(GET, "https://x/y");
+    RequestBuilder d = request(GET, "https://x/y");
     assert(!d._tls.no_verify);
 }
 
@@ -414,7 +414,7 @@ fn void test_transfer_encoding_list_chunked() @test
 // #9 (builder side): more than MAX_HEADERS headers faults TOO_MANY_HEADERS.
 fn void test_builder_header_overflow() @test
 {
-    RequestBuilder b = new_request(GET, "http://x/y");
+    RequestBuilder b = request(GET, "http://x/y");
     for (usz i = 0; i < MAX_HEADERS + 1; i++) b.header("K", "v");
     if (try resp = b.send(mem))
     {

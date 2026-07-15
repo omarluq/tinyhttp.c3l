@@ -99,7 +99,7 @@ struct RequestBuilder
    UNSENT RequestBuilder: chain `.header()` / `.body()` / `.timeout()` / `.tls()`,
    then call `.send()` to execute — unlike `Client.request` / `request_url`, no
    I/O happens here. *>
-fn RequestBuilder new_request(Method method, String url) => { .method = method, .url = url };
+fn RequestBuilder request(Method method, String url) => { .method = method, .url = url };
 
 <* Append a header. Returns the builder for chaining. Beyond MAX_HEADERS the
    builder is marked overflowed and `send` will fault. *>
