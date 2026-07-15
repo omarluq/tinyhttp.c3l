@@ -10,10 +10,10 @@ import std::net::os;
 import std::time;
 
 // R12: disable Nagle's algorithm so small request writes go out immediately.
-// The os module only defines these in its no-libc fallback (compiled out on real
-// platforms), so both socket-option constants are declared locally to stay portable.
-const CInt TCP_LEVEL_IPPROTO_TCP @private = 6;
-const CInt TCP_OPT_NODELAY @private = 1;
+// std::net::os exposes IPPROTO_TCP only in its no-libc fallback and does not expose
+// a TCP_NODELAY constant at all, so both are declared locally.
+const CInt IPPROTO_TCP @private = 6;
+const CInt TCP_NODELAY @private = 1;
 
 <* A blocking byte transport built on the stdlib stream interfaces:
    `read`/`write` move bytes (0 from `read` == peer closed) or fault;
@@ -55,6 +55,6 @@ fn PlainConn? dial(String host, int port, Duration timeout = time::DURATION_ZERO
     // R12: best-effort TCP_NODELAY; failure to tune is non-fatal, so the CInt
     // result is intentionally discarded.
     CInt nodelay = 1;
-    (void)os::setsockopt(sock.sock, TCP_LEVEL_IPPROTO_TCP, TCP_OPT_NODELAY, &nodelay, CInt::size);
+    (void)os::setsockopt(sock.sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, CInt::size);
     return { .sock = sock };
 }
