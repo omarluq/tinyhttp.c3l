@@ -39,10 +39,23 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
     DString req = dstring::temp_with_capacity(256);
     defer req.free();
 
-    req.appendf("%s %s HTTP/1.1\r\n", method.name, path)!;
-    if (!has_header(headers, "Host")) req.appendf("Host: %s\r\n", host)!;
+    req.append_string(method.name);
+    req.append_char(' ');
+    req.append_string(path);
+    req.append_string(" HTTP/1.1\r\n");
+    if (!has_header(headers, "Host"))
+    {
+        req.append_string("Host: ");
+        req.append_string(host);
+        req.append_string("\r\n");
+    }
     if (close || has_connection_close(headers)) req.append_string("Connection: close\r\n");
-    if (!has_header(headers, "User-Agent")) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
+    if (!has_header(headers, "User-Agent"))
+    {
+        req.append_string("User-Agent: ");
+        req.append_string(USER_AGENT);
+        req.append_string("\r\n");
+    }
 
     bool has_content_length = false;
     foreach (&h : headers)
@@ -51,7 +64,10 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
         String hvalue = (String)h.value;
         if (has_crlf(hname) || has_crlf(hvalue)) return INVALID_HEADER~;
         if (ci_eq(h.name, "Connection")) continue;
-        req.appendf("%s: %s\r\n", hname, hvalue)!;
+        req.append_string(hname);
+        req.append_string(": ");
+        req.append_string(hvalue);
+        req.append_string("\r\n");
         if (ci_eq(h.name, "Content-Length")) has_content_length = true;
     }
     if (body.len != 0 && !has_content_length) req.appendf("Content-Length: %d\r\n", body.len)!;
