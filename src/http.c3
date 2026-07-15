@@ -1,6 +1,7 @@
 // tinyhttp HTTP/1.1 client core: send a request over a Conn and read the
-// response back through the parser. Increment 1 is blocking and uses
-// "Connection: close" (read the whole response, then parse).
+// response back through the parser. The reader frames the body precisely (per
+// RFC 7230) so a keep-alive connection can be reused; only a close-delimited
+// body (no Content-Length, not chunked) is read to EOF.
 //
 // Allocation model (R9): callers pass a single Allocator that owns the
 // Response. Internally this module uses a two-tier scheme: transient work
@@ -27,40 +28,202 @@ faultdef
     INVALID_URL,          // url could not be parsed into a usable http:// target
     INCOMPLETE_RESPONSE,  // Content-Length exceeded the bytes received before EOF
     TLS_FAILED,           // TLS setup, read, or write failed
-    TLS_HANDSHAKE_FAILED; // TLS handshake or certificate verification failed
+    TLS_HANDSHAKE_FAILED, // TLS handshake or certificate verification failed
+    STALE_CONNECTION;     // internal retry signal: a reused keep-alive conn was closed before the response arrived; consumed by the retry-once path and never returned to the user
 
 const usz MAX_RESPONSE_HEADERS @private = 100;
 const usz MAX_RESPONSE_BYTES @private = 32 * 1024 * 1024;
 const int DEFAULT_HTTP_PORT @private = 80;
 const int DEFAULT_HTTPS_PORT @private = 443;
 
-<* Send a request over an already-open connection and read the response. The
-   low-level entry point: convenience wrappers and `Client` build on it, and
-   tests drive it with a mock `Conn`. *>
+<* Send a request over an already-open connection and read the response back. The
+   low-level entry point: convenience wrappers and `Client` build on it, and tests
+   drive it with a mock `Conn`. Sends `Connection: close` and frames the response
+   body exactly — bodiless (HEAD/1xx/204/304), Content-Length, or chunked — reading
+   to EOF only for a close-delimited body. The connection is not reused. *>
 fn Response? send(Allocator allocator, Conn conn, Method method, String host, String path, Header[] headers = {}, char[] body = {})
 {
     write_request(conn, method, host, path, headers, body)!;
     return read_response(allocator, conn, method);
 }
 
-fn Response? read_response(Allocator allocator, Conn conn, Method method) @private
+<* Read one HTTP/1.1 response from `conn` into a single owned buffer (Response.raw).
+
+   The header block is read incrementally, then the body is consumed by its declared
+   framing so the reader stops exactly at the message end and the connection stays
+   reusable: bodiless (HEAD/1xx/204/304), Content-Length, or chunked transfer-encoding.
+   Only a body delimited by neither Content-Length nor chunking (an HTTP/1.0-style
+   close-delimited body) is read to EOF.
+
+   `reused` marks a connection drawn from the keep-alive pool: if the very first read
+   sees a closed/empty socket the response never started, so STALE_CONNECTION is raised
+   and the caller can retry once on a fresh connection. When `reusable` is non-null it
+   receives whether this connection may return to the pool — the body was precisely
+   delimited, neither side asked to close, and no trailing bytes remain. *>
+fn Response? read_response(Allocator allocator, Conn conn, Method method, bool reused = false, bool* reusable = null) @private
 {
     // R11: read straight into the ByteWriter's spare capacity (no stack chunk + second memcpy).
     ByteWriter w;
     w.init(allocator);
     defer catch (void)w.destroy();   // frees the buffer on any fault exit; on success Response owns it
+
+    httpparser::Header[MAX_RESPONSE_HEADERS] hstore;
+    httpparser::Response presp;
+    usz received = 0;   // cumulative bytes read, for the size cap
+    usz last = 0;       // buf length at the previous parse attempt (slowloris check)
+    usz consumed = 0;   // header-block length, once parsed
+
+    // PHASE 1: read the status line + header block, re-parsing after each read.
     while (true)
     {
         w.ensure_capacity(w.index + 4096)!;
-        sz n = conn.read(w.bytes[w.index..])!;
-        if (n <= 0) break;
+        sz? nr = conn.read(w.bytes[w.index..]);
+        if (catch e = nr)
+        {
+            if (reused && w.index == 0) return STALE_CONNECTION~;   // idle keep-alive conn was closed
+            return e~;
+        }
+        sz n = nr;
+        if (n == 0)
+        {
+            if (reused && w.index == 0) return STALE_CONNECTION~;
+            return MALFORMED_RESPONSE~;                             // EOF before a complete header block
+        }
         w.index += n;
-        if ((usz)w.index > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
-    }
-    char[] raw = w.array_view();   // .ptr == allocation base; Response.free frees it
+        received += (usz)n;
+        if (received > MAX_RESPONSE_BYTES || (usz)w.index > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
 
-    // R13: shrink the power-of-two over-allocation, keeping w.bytes in sync so the
-    // defer-catch frees the right (possibly moved) pointer and every slice derives from it.
+        usz? c = httpparser::parse_response(w.array_view(), &presp, hstore[..], last);
+        if (catch pe = c)
+        {
+            if (pe == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
+            last = (usz)w.index;   // INCOMPLETE: valid prefix, read more
+            continue;
+        }
+        consumed = c;   // parsed: c is the header-block length
+        break;
+    }
+
+    // Framing SCALARS from the phase-1 parse. Header token slices are invalidated by
+    // later buffer growth, so capture values (never slices) now.
+    // R2: RFC 7230 §3.3.3 — HEAD, 1xx, 204, 304 carry no body regardless of framing headers.
+    bool bodiless = method == HEAD
+        || (presp.status >= 100 && presp.status < 200)
+        || presp.status == 204
+        || presp.status == 304;
+
+    bool is_chunked = false;
+    long content_length = -1;
+    if (!bodiless)
+    {
+        // R5 + R14: chunked iff the FINAL transfer-coding across ALL Transfer-Encoding
+        // header lines is chunked (multiple TE headers == one comma list; last one wins).
+        String te = "";
+        bool have_te = false;
+        foreach (&h : presp.headers) if (ci_eq(h.name, "Transfer-Encoding")) { te = (String)h.value; have_te = true; }
+        if (have_te)
+        {
+            String last_te = te;
+            if (try i = te.rindex_of(",")) last_te = te[i + 1..];
+            is_chunked = ci_eq((char[])last_te.trim(), "chunked");
+        }
+        if (!is_chunked)
+        {
+            String cl = find_header(presp.headers, "Content-Length");
+            if (cl.len != 0) content_length = (long)(cl.to_ulong() ?? MALFORMED_RESPONSE~!);
+        }
+    }
+    String conn_hdr = find_header(presp.headers, "Connection");
+    bool resp_close = conn_has_token(conn_hdr, "close");
+    bool resp_keepalive = conn_has_token(conn_hdr, "keep-alive");
+    int minor_version = presp.minor_version;
+
+    // PHASE 2: consume exactly the framed body. `have` = body bytes already buffered.
+    usz have = (usz)w.index - consumed;
+    usz body_len = 0;
+    usz leftover = 0;
+    if (bodiless)
+    {
+        body_len = 0;
+        leftover = have;
+    }
+    else if (content_length >= 0)
+    {
+        while (have < (usz)content_length)
+        {
+            w.ensure_capacity((sz)(consumed + (usz)content_length))!;
+            sz? nr = conn.read(w.bytes[w.index..]);   // read into the spare capacity
+            if (catch e = nr) return e~;
+            sz n = nr;
+            if (n == 0) return INCOMPLETE_RESPONSE~;   // fewer bytes than Content-Length before EOF
+            w.index += n;
+            received += (usz)n;
+            if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
+            have = (usz)w.index - consumed;
+        }
+        body_len = (usz)content_length;
+        leftover = have - body_len;
+        w.index = (sz)(consumed + body_len);   // drop any trailing (pipelined) bytes
+    }
+    else if (is_chunked)
+    {
+        // Incremental in-place decode: each pass feeds only the newly-read bytes and
+        // appends decoded output right after the previously-decoded region. Recompute
+        // the base slice from array_view() every pass because ensure_capacity may move
+        // the buffer. The decoder only ever rewrites raw[consumed..]; header bytes stay put.
+        httpparser::ChunkedDecoder dec = { .consume_trailer = true };
+        usz decoded = 0;
+        usz seg = have;
+        while (true)
+        {
+            usz seg2 = seg;
+            usz? left = httpparser::decode_chunked(&dec, ((w.array_view())[consumed..])[decoded..], &seg2);
+            decoded += seg2;
+            w.index = (sz)(consumed + decoded);
+            if (catch e2 = left)
+            {
+                if (e2 == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
+                // INCOMPLETE: append more chunk bytes past the decoded region and decode
+                // again. w.index (== consumed+decoded here) must advance by the bytes read
+                // so the next array_view() exposes them as the new segment.
+                w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
+                sz? nr = conn.read(w.bytes[w.index..]);
+                if (catch e = nr) return e~;
+                sz n = nr;
+                if (n == 0) return INCOMPLETE_RESPONSE~;   // EOF mid-chunk
+                w.index += n;
+                received += (usz)n;
+                if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
+                seg = (usz)n;
+                continue;
+            }
+            body_len = decoded;
+            leftover = left;
+            break;
+        }
+    }
+    else
+    {
+        // Close-delimited (HTTP/1.0 style): no Content-Length, not chunked. Read until
+        // EOF. Never poolable (the framing boundary is the connection close itself).
+        while (true)
+        {
+            w.ensure_capacity(w.index + 4096)!;
+            sz? nr = conn.read(w.bytes[w.index..]);
+            if (catch e = nr) return e~;
+            sz n = nr;
+            if (n == 0) break;
+            w.index += n;
+            received += (usz)n;
+            if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
+        }
+        body_len = (usz)w.index - consumed;
+        leftover = 0;
+    }
+
+    // PHASE 3 (R13): shrink the power-of-two over-allocation, keeping w.bytes in sync so
+    // the defer-catch frees the right (possibly moved) pointer and every slice derives from it.
+    char[] raw = w.array_view();   // .ptr == allocation base; Response.free frees it
     if (w.bytes.len > w.index)
     {
         char* p = alloc::realloc(allocator, raw.ptr, w.index);
@@ -68,77 +231,61 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method) @priva
         raw = p[:w.index];
     }
 
-    // Parse the status line + headers (into the possibly-moved raw).
-    httpparser::Header[MAX_RESPONSE_HEADERS] hstore;
-    httpparser::Response presp;
-    usz? consumed = httpparser::parse_response(raw, &presp, hstore[..], 0);
-    if (catch consumed) return MALFORMED_RESPONSE~;
+    // PHASE 4: re-parse the now-stable, shrunk buffer to get output header/body slices.
+    // The double parse is intentional: phase 1 drives framing while the buffer still
+    // grows; phase 4 yields stable slices into the final allocation.
+    httpparser::Response presp2;
+    usz consumed2 = httpparser::parse_response(raw, &presp2, hstore[..], 0)!;
+    char[] body = raw[consumed2 : body_len];   // bytes [consumed2 .. consumed2 + body_len)
 
-    char[] rest = raw[consumed..];
-    char[] body;
-
-    // R2: RFC 7230 §3.3.3 — HEAD, 1xx, 204, 304 carry no body regardless of framing headers.
-    bool bodiless = method == HEAD
-        || (presp.status >= 100 && presp.status < 200)
-        || presp.status == 204
-        || presp.status == 304;
-    if (bodiless)
-    {
-        body = rest[:0];
-    }
-    else
-    {
-        // R5 + R14: chunked iff the FINAL transfer-coding across ALL Transfer-Encoding
-        // header lines is chunked (multiple TE headers == one comma list; last one wins).
-        String te = "";
-        bool have_te = false;
-        foreach (&h : presp.headers) if (ci_eq(h.name, "Transfer-Encoding")) { te = (String)h.value; have_te = true; }
-        bool is_chunked = false;
-        if (have_te)
-        {
-            String last = te;
-            if (try i = te.rindex_of(",")) last = te[i + 1..];
-            is_chunked = ci_eq((char[])last.trim(), "chunked");
-        }
-        if (is_chunked)
-        {
-            httpparser::ChunkedDecoder dec = { .consume_trailer = true };
-            usz bsz = rest.len;
-            if (catch httpparser::decode_chunked(&dec, rest, &bsz)) return MALFORMED_RESPONSE~;
-            body = rest[:bsz];
-        }
-        else
-        {
-            String cl = find_header(presp.headers, "Content-Length");
-            if (cl.len != 0)
-            {
-                ulong len = cl.to_ulong() ?? MALFORMED_RESPONSE~!;
-                if (len > rest.len) return INCOMPLETE_RESPONSE~;   // R2: expected body larger than received
-                body = rest[:(usz)len];
-            }
-            else
-            {
-                body = rest;
-            }
-        }
-    }
-
-    usz nh = presp.headers.len;
+    usz nh = presp2.headers.len;
     Header[] headers = {};
     if (nh != 0)
     {
         headers = alloc::new_array(allocator, Header, (sz)nh);
-        headers[..] = presp.headers[..];
+        headers[..] = presp2.headers[..];
+    }
+
+    // Reusability: precisely delimited, both peers persistent, and no trailing bytes
+    // (leftover > 0 means unframed data we can't push back into the socket).
+    if (reusable != null)
+    {
+        bool delimited = bodiless || content_length >= 0 || is_chunked;
+        bool persistent = minor_version >= 1 ? !resp_close : resp_keepalive;
+        *reusable = delimited && persistent && leftover == 0;
     }
 
     return {
-        .status = presp.status,
-        .minor_version = presp.minor_version,
+        .status = presp2.status,
+        .minor_version = presp2.minor_version,
         .headers = headers,
         .body = body,
         .raw = raw,
         .allocator = allocator,
     };
+}
+
+<* Write a request and read its response over an already-open connection, threading
+   keep-alive state for `Client.request`. `reused` marks a pooled connection: a write
+   failure or a dead first read surfaces as STALE_CONNECTION so the caller can retry
+   once on a fresh connection. A fresh connection passes `reused` false, so read_response
+   can never raise STALE_CONNECTION there and the signal never escapes to the user. On
+   success `*reusable` says whether the connection may return to the pool — the response
+   permitted reuse AND the request itself did not send Connection: close. *>
+fn Response? do_exchange(Allocator allocator, Conn conn, Method method, String host, String path, Header[] headers, char[] body, bool reused, bool* reusable) @private
+{
+    if (reused)
+    {
+        if (catch write_request(conn, method, host, path, headers, body, close: false)) return STALE_CONNECTION~;
+    }
+    else
+    {
+        write_request(conn, method, host, path, headers, body, close: false)!;
+    }
+    bool resp_reusable = false;
+    Response resp = read_response(allocator, conn, method, reused, &resp_reusable)!;   // STALE_CONNECTION propagates when reused && the first read failed
+    *reusable = resp_reusable && !has_connection_close(headers);
+    return resp;
 }
 
 // ---- convenience wrappers (open a connection, send, close) ------------------

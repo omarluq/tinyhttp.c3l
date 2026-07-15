@@ -24,3 +24,22 @@ fn bool has_header(Header[] headers, String name) @private
     foreach (&h : headers) if (ci_eq(h.name, name)) return true;
     return false;
 }
+
+// Case-insensitive scan of a comma-separated header value for an exact token.
+fn bool conn_has_token(String value, String token) @private
+{
+    if (value.len == 0) return false;
+    Splitter it = value.tokenize(",");
+    while (try part = it.next())
+    {
+        if (ci_eq(part.trim(), token)) return true;
+    }
+    return false;
+}
+
+// True if any Connection header carries the "close" token.
+fn bool has_connection_close(Header[] headers) @private
+{
+    foreach (&h : headers) if (ci_eq(h.name, "Connection") && conn_has_token((String)h.value, "close")) return true;
+    return false;
+}

@@ -1,8 +1,9 @@
 // A reusable HTTP client: a base URL, default headers, and a connection timeout,
-// applied to every request. (Increment 1's one-connection-per-request transport
-// still applies.)
+// applied to every request. Client.request reuses connections through a
+// keep-alive pool (Increment 4); the convenience wrappers stay one-shot.
 
 module tinyhttp;
+import std::net::url;
 import std::time;
 
 <* Configuration reused across requests. `base_url` is prepended to each path,
@@ -17,11 +18,12 @@ struct Client
     Header[]  default_headers;
     Duration  timeout;
     TlsConfig tls;          // applied to https:// requests (default: verify vs the system CA bundle)
+    ConnPool  pool;         // keep-alive pool of idle connections, keyed by scheme|host|port
 }
 
 <* Create a client. *>
 fn Client client(Allocator allocator, String base_url = "", Header[] default_headers = {}, Duration timeout = time::DURATION_ZERO, TlsConfig tls = {})
-    => { .allocator = allocator, .base_url = base_url, .default_headers = default_headers, .timeout = timeout, .tls = tls };
+    => { .allocator = allocator, .base_url = base_url, .default_headers = default_headers, .timeout = timeout, .tls = tls, .pool = { .allocator = allocator } };
 
 <* Append `src` into `dst` starting at `count`; raise TOO_MANY_HEADERS if they
    would not all fit. Returns the new count. *>
@@ -56,7 +58,13 @@ fn usz? merge_headers(Header[] dst, Header[] defaults, Header[] overrides) @priv
 
 <* Perform `method` on base_url+path, merging the default headers with `headers`:
    a per-call header REPLACES (overrides) a default of the same name, so defaults
-   contribute only the names `headers` does not provide (up to MAX_HEADERS total). *>
+   contribute only the names `headers` does not provide (up to MAX_HEADERS total).
+
+   Connections are reused through the client's keep-alive pool: an idle conn for
+   the target scheme|host|port is tried first (retrying once on a stale idle
+   socket), otherwise a fresh connection is dialed. A precisely-delimited,
+   still-persistent response returns its conn to the pool; anything else closes
+   it. Call `close` when done to release pooled sockets. *>
 fn Response? Client.request(&self, Method method, String path, Header[] headers = {}, char[] body = {})
 {
     String url = self.base_url.len != 0 ? self.base_url.tconcat(path) : path;
@@ -64,7 +72,85 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     Header[MAX_HEADERS] merged;
     usz m = merge_headers(merged[..], self.default_headers, headers)!;
 
-    return request_url(method, url, merged[:m], body, self.timeout, self.allocator, self.tls);
+    Url u; String host_hdr; String target;
+    make_request_target(url, &u, &host_hdr, &target)!;
+    bool is_https = ci_eq(u.scheme, "https");
+    int port = u.port ?: (is_https ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT);
+    String scheme = is_https ? "https" : "http";
+    String key = pool_key(scheme, u.host, port);
+
+    // Pooled attempt: reuse an idle connection if one is available.
+    if (try ic = self.pool.checkout(key))
+    {
+        bool reusable;
+        Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, merged[:m], body, true, &reusable);
+        if (catch e = r)
+        {
+            self.pool.discard(ic);
+            if (e != STALE_CONNECTION) return e~;   // real fault; a stale idle socket falls through to a fresh dial
+        }
+        else
+        {
+            if (reusable) { self.pool.checkin(key, ic); }
+            else { self.pool.discard(ic); }
+            return r;
+        }
+    }
+
+    // Fresh connection (also the stale-retry path; reused:false, so STALE_CONNECTION cannot arise here).
+    IdleConn ic = self.dial_idle(is_https, u.host, port)!;
+    bool reusable;
+    Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, merged[:m], body, false, &reusable);
+    if (catch e = r)
+    {
+        self.pool.discard(ic);
+        return e~;
+    }
+    if (reusable) { self.pool.checkin(key, ic); }
+    else { self.pool.discard(ic); }
+    return r;
+}
+
+<* Drain and close every connection held in the keep-alive pool, releasing their
+   sockets. A Client that made requests must be closed to release the pooled
+   sockets; the convenience wrappers close their connections eagerly and need no
+   cleanup. *>
+fn void Client.close(&self)
+{
+    self.pool.free();
+}
+
+<* Compose the transient pool key "scheme|host|port". The key lives in `tmem`;
+   ConnPool.checkin copies it into the pool allocator when it stores an entry. *>
+fn String pool_key(String scheme, String host, int port) @private
+    => string::tformat("%s|%s|%d", scheme, host, port);
+
+<* Dial a fresh connection into a heap object owned by the Client allocator,
+   returning it wrapped as an IdleConn (`.conn` = the Conn fat pointer, `.mem` =
+   the heap allocation to free). Frees the object if the dial fails. *>
+fn IdleConn? Client.dial_idle(&self, bool is_https, String host, int port) @private
+{
+    if (is_https)
+    {
+        TlsConn* c = alloc::new(self.allocator, TlsConn);
+        TlsConn? conn = dial_tls(host, port, self.tls, self.timeout);
+        if (catch e = conn)
+        {
+            alloc::free(self.allocator, c);
+            return e~;
+        }
+        *c = conn;
+        return { .conn = (Conn)c, .mem = c };
+    }
+    PlainConn* c = alloc::new(self.allocator, PlainConn);
+    PlainConn? conn = dial(host, port, self.timeout);
+    if (catch e = conn)
+    {
+        alloc::free(self.allocator, c);
+        return e~;
+    }
+    *c = conn;
+    return { .conn = (Conn)c, .mem = c };
 }
 
 <* GET base_url+path with the default headers merged with `headers`. *>

@@ -438,3 +438,314 @@ fn void test_multi_line_transfer_encoding_chunked() @test
 
     assert(resp.body == "abc");
 }
+
+// ---- Increment 4: keep-alive / connection reuse ----------------------------
+
+// A Conn that serves a SEQUENCE of canned responses over one connection, one per
+// request/response cycle, to exercise keep-alive reuse. A write that follows a read
+// advances to the next canned response, mimicking a server answering the next
+// request on a persistent connection. The precise reader must stop exactly at each
+// response boundary (never reading to EOF) for the following response to line up.
+struct SeqConn (Conn)
+{
+    String[] responses;
+    usz      idx;        // response currently being served
+    usz      read_pos;   // read offset within responses[idx]
+    bool     any_read;   // have we served bytes from the current response yet?
+    DString  written;
+}
+
+fn sz? SeqConn.read(&self, char[] buf) @dynamic
+{
+    if (self.idx >= self.responses.len) return 0;          // no more responses: EOF
+    char[] cur = (char[])self.responses[self.idx];
+    usz avail = cur.len - self.read_pos;
+    if (avail == 0) return 0;                              // current response drained
+    usz n = avail < buf.len ? avail : buf.len;
+    buf[:n] = cur[self.read_pos:n];
+    self.read_pos += n;
+    self.any_read = true;
+    return (sz)n;
+}
+
+fn sz? SeqConn.write(&self, char[] buf) @dynamic
+{
+    // A write after the current response has been read starts the next
+    // request/response cycle: advance to the next canned response.
+    if (self.any_read)
+    {
+        self.idx++;
+        self.read_pos = 0;
+        self.any_read = false;
+    }
+    self.written.append_bytes(buf);
+    return (sz)buf.len;
+}
+
+fn void? SeqConn.close(&self) @dynamic {}
+fn char? SeqConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
+fn void? SeqConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
+
+// K1: pool_key composes "scheme|host|port"; http and https never share a bucket.
+fn void test_pool_key() @test
+{
+    assert(pool_key("http", "example.com", 80) == "http|example.com|80");
+    assert(pool_key("https", "example.com", 443) == "https|example.com|443");
+    assert(pool_key("http", "x", 8080) == "http|x|8080");
+    assert(pool_key("http", "x", 80) != pool_key("https", "x", 80));
+}
+
+// K2: conn_has_token is a case-insensitive, comma-delimited token scan (not a
+// substring match), and empty values never match.
+fn void test_conn_has_token() @test
+{
+    assert(conn_has_token("close", "close"));
+    assert(conn_has_token("keep-alive, close", "close"));
+    assert(conn_has_token("keep-alive, close", "keep-alive"));
+    assert(conn_has_token("CLOSE", "close"));                 // case-insensitive value
+    assert(conn_has_token("Keep-Alive", "keep-alive"));
+    assert(!conn_has_token("keep-alive", "close"));
+    assert(!conn_has_token("closer", "close"));               // token boundary, not substring
+    assert(!conn_has_token("", "close"));                     // empty value never matches
+}
+
+// K3: has_connection_close scans every Connection header (case-insensitive name)
+// via the token scanner, distinguishing keep-alive from close.
+fn void test_has_connection_close() @test
+{
+    Header[2] with_close = {
+        { .name = "Connection", .value = "close" },
+        { .name = "X",          .value = "y" },
+    };
+    assert(has_connection_close(with_close[..]));
+
+    Header[1] keep = { { .name = "Connection", .value = "keep-alive" } };
+    assert(!has_connection_close(keep[..]));
+
+    Header[1] none = { { .name = "X", .value = "y" } };
+    assert(!has_connection_close(none[..]));
+
+    Header[1] list = { { .name = "connection", .value = "keep-alive, close" } };
+    assert(has_connection_close(list[..]));                   // ci name + token scan
+}
+
+// K4: checkout on an uninitialized pool misses with POOL_EMPTY (never a crash),
+// and free on an uninitialized pool is a no-op.
+fn void test_pool_checkout_empty() @test
+{
+    ConnPool pool = { .allocator = mem };
+    if (catch e = pool.checkout("http|x|80"))
+    {
+        assert(e == POOL_EMPTY);
+    }
+    else
+    {
+        assert(false, "expected POOL_EMPTY from an uninitialized pool");
+    }
+    pool.free();                                              // never inited -> no-op, no leak
+}
+
+// K5: checkin then checkout returns the same idle conn (LIFO); a second checkout
+// on the drained bucket misses. free reclaims the returned conn and the owned key.
+fn void test_pool_checkin_checkout_lifo() @test
+{
+    ConnPool pool = { .allocator = mem };
+    MockConn* m = alloc::new(mem, MockConn);
+    IdleConn ic = { .conn = (Conn)m, .mem = m };
+
+    pool.checkin("http|x|80", ic);
+    IdleConn got = pool.checkout("http|x|80")!!;
+    assert(got.mem == (void*)m);                             // same concrete conn back
+
+    if (catch e = pool.checkout("http|x|80"))
+    {
+        assert(e == POOL_EMPTY);                             // bucket now empty
+    }
+    else
+    {
+        assert(false, "expected POOL_EMPTY after the only idle conn was taken");
+    }
+
+    pool.checkin("http|x|80", got);                          // return it so free reclaims it
+    pool.free();
+}
+
+// K6: a Content-Length response over HTTP/1.1 with no Connection: close and no
+// trailing bytes is framed precisely and marked reusable.
+fn void test_read_response_reusable_content_length() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "hello");
+    assert(reusable);
+}
+
+// K7: a chunked response over HTTP/1.1 is framed precisely and marked reusable.
+fn void test_read_response_reusable_chunked() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "abc");
+    assert(reusable);
+}
+
+// K8: a response advertising Connection: close is not reusable even though its
+// body is precisely delimited.
+fn void test_read_response_not_reusable_connection_close() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "abc");
+    assert(!reusable);                                       // server asked to close
+}
+
+// K9: a close-delimited HTTP/1.0 body (read to EOF) is never reusable.
+fn void test_read_response_not_reusable_read_to_eof() @test
+{
+    MockConn m = mock("HTTP/1.0 200 OK\r\n\r\nplain body");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "plain body");
+    assert(!reusable);                                       // boundary is the close itself
+}
+
+// K10: pipelined trailing bytes (a second response already in the buffer) are
+// dropped, and their presence makes the connection non-reusable (leftover > 0).
+fn void test_read_response_leftover_not_reusable() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "hello");                            // only the first body; trailer dropped
+    assert(!reusable);                                       // unframed trailing bytes remain
+}
+
+// K11: two responses served over ONE connection prove reuse. do_exchange on a
+// fresh conn then on the same conn (reused:true) reads each body precisely without
+// hitting EOF, and both connections are marked reusable.
+fn void test_keep_alive_two_responses_one_conn() @test
+{
+    String[2] resps = {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld",
+    };
+    SeqConn m;
+    m.responses = resps[..];
+    m.written = dstring::new(mem);
+    defer m.written.free();
+
+    bool ru1;
+    Response r1 = do_exchange(mem, &m, GET, "x", "/", {}, {}, false, &ru1)!!;
+    defer r1.free();
+    assert(r1.body == "hello");
+    assert(ru1);
+
+    bool ru2;
+    Response r2 = do_exchange(mem, &m, GET, "x", "/", {}, {}, true, &ru2)!!;
+    defer r2.free();
+    assert(r2.body == "world");
+    assert(ru2);
+
+    String req = m.written.str_view();
+    assert(count_occurrences(req, "GET / HTTP/1.1\r\n") == 2);   // both cycles on one conn
+    assert(!req.contains("Connection: close"));                 // persistent path
+}
+
+// K12: Client.request reuses a pooled connection. Seeding the pool with a mock
+// under the key request() computes lets both requests ride the same conn (no real
+// dial); the recorded writes prove two request/response cycles over one socket.
+fn void test_client_pool_reuse() @test
+{
+    String[2] resps = {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld",
+    };
+    SeqConn* m = alloc::new(mem, SeqConn);
+    m.responses = resps[..];
+    m.written = dstring::new(mem);
+
+    Client c = client(mem, "http://x");
+    c.pool.checkin(pool_key("http", "x", 80), { .conn = (Conn)m, .mem = m });
+
+    Response r1 = c.request(GET, "/")!!;
+    defer r1.free();
+    assert(r1.body == "hello");
+
+    Response r2 = c.request(GET, "/")!!;
+    defer r2.free();
+    assert(r2.body == "world");
+
+    assert(count_occurrences(m.written.str_view(), "GET / HTTP/1.1\r\n") == 2);
+
+    m.written.free();     // free the DString before close frees the conn struct (m.mem)
+    c.close();            // drains the pool: closes + frees the pooled conn and its key
+}
+
+// K13: a reused idle conn found dead (first read is EOF) surfaces STALE_CONNECTION
+// so the caller can retry; the fault carries the internal retry signal.
+fn void test_stale_connection_detected() @test
+{
+    MockConn m = mock("");                                   // closed idle socket
+    defer m.written.free();
+
+    bool reusable;
+    Response? r = do_exchange(mem, &m, GET, "x", "/", {}, {}, true, &reusable);
+    if (try resp = r)
+    {
+        resp.free();
+        assert(false, "expected STALE_CONNECTION on a dead reused conn");
+    }
+    if (catch e = r) assert(e == STALE_CONNECTION);
+}
+
+// K14: the stale-retry path in miniature: a reused idle conn is found dead
+// (STALE_CONNECTION), then the same request on a FRESH conn (reused:false) succeeds
+// and can never observe STALE.
+fn void test_stale_then_fresh_retry() @test
+{
+    MockConn dead = mock("");
+    defer dead.written.free();
+
+    bool ru1;
+    Response? stale = do_exchange(mem, &dead, GET, "x", "/", {}, {}, true, &ru1);
+    if (try resp = stale)
+    {
+        resp.free();
+        assert(false, "expected STALE_CONNECTION from the dead idle conn");
+    }
+    if (catch e = stale) assert(e == STALE_CONNECTION);
+
+    MockConn fresh = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    defer fresh.written.free();
+
+    bool ru2;
+    Response resp = do_exchange(mem, &fresh, GET, "x", "/", {}, {}, false, &ru2)!!;
+    defer resp.free();
+    assert(resp.body == "hi");
+    assert(ru2);
+    assert(fresh.written.str_view().contains("GET / HTTP/1.1\r\n"));
+    assert(!fresh.written.str_view().contains("Connection: close"));   // persistent path
+}

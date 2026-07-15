@@ -21,17 +21,18 @@ enum Method : char (String name)
 
 <* Serialize an HTTP/1.1 request and write it to `conn`. Host, a default
    User-Agent, and Content-Length for a body are each added only if the caller
-   did not already supply them; Connection: close is always sent (the read path
-   reads to EOF and needs it). Caller header names/values containing CR or LF
-   fault with INVALID_HEADER. *>
-fn void? write_request(Conn conn, Method method, String host, String path, Header[] headers, char[] body) @private
+   did not already supply them. Connection: close is sent only when `close` is
+   true (the default, used by the one-shot send() path); the pooled/Client path
+   passes close:false so the HTTP/1.1 connection stays persistent. Caller header
+   names/values containing CR or LF fault with INVALID_HEADER. *>
+fn void? write_request(Conn conn, Method method, String host, String path, Header[] headers, char[] body, bool close = true) @private
 {
     DString req = dstring::temp_with_capacity(256);
     defer req.free();
 
     req.appendf("%s %s HTTP/1.1\r\n", method.name, path)!;
     if (!has_header(headers, "Host")) req.appendf("Host: %s\r\n", host)!;
-    req.append_string("Connection: close\r\n");
+    if (close) req.append_string("Connection: close\r\n");
     if (!has_header(headers, "User-Agent")) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
 
     bool has_content_length = false;
