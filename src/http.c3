@@ -60,6 +60,84 @@ fn sz? read_into(Conn conn, ByteWriter* w, usz* received) @private
     return n;
 }
 
+// The outcome of consuming a framed body: the decoded/copied body length written
+// into raw[consumed..] and the count of trailing bytes buffered past the message
+// end. Each body strategy leaves w.index at consumed + body_len so the phase-3
+// shrink and phase-4 re-parse observe identical buffer state. (C3 has no tuple
+// returns, so the two scalars ride out together.)
+struct BodyFrame @private
+{
+    usz body_len;
+    usz leftover;
+}
+
+// Content-Length body: read until `content_length` body bytes are buffered past the
+// header block, then trim any trailing (pipelined) bytes. `received` stays running so
+// the MAX_RESPONSE_BYTES cap spans the whole response.
+fn BodyFrame? read_body_content_length(Conn conn, ByteWriter* w, usz consumed, usz content_length, usz* received) @private
+{
+    usz have = (usz)w.index - consumed;
+    while (have < content_length)
+    {
+        w.ensure_capacity((sz)(consumed + content_length))!;
+        sz? nr = read_into(conn, w, received);   // read into the spare capacity
+        if (catch e = nr) return e~;
+        sz n = nr;
+        if (n == 0) return INCOMPLETE_RESPONSE~;   // fewer bytes than Content-Length before EOF
+        have = (usz)w.index - consumed;
+    }
+    w.index = (sz)(consumed + content_length);   // drop any trailing (pipelined) bytes
+    return { .body_len = content_length, .leftover = have - content_length };
+}
+
+// Chunked body: incremental in-place decode. Each pass feeds only the newly-read bytes
+// and appends decoded output right after the previously-decoded region. Recompute the
+// base slice from array_view() every pass because ensure_capacity may move the buffer;
+// the decoder only ever rewrites raw[consumed..], so header bytes stay put.
+fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* received) @private
+{
+    httpparser::ChunkedDecoder dec = { .consume_trailer = true };
+    usz decoded = 0;
+    usz seg = (usz)w.index - consumed;
+    while (true)
+    {
+        usz seg2 = seg;
+        usz? left = httpparser::decode_chunked(&dec, ((w.array_view())[consumed..])[decoded..], &seg2);
+        decoded += seg2;
+        w.index = (sz)(consumed + decoded);
+        if (catch e2 = left)
+        {
+            if (e2 == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
+            // INCOMPLETE: append more chunk bytes past the decoded region and decode
+            // again. w.index (== consumed+decoded here) must advance by the bytes read
+            // so the next array_view() exposes them as the new segment.
+            w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
+            sz? nr = read_into(conn, w, received);
+            if (catch e = nr) return e~;
+            sz n = nr;
+            if (n == 0) return INCOMPLETE_RESPONSE~;   // EOF mid-chunk
+            seg = (usz)n;
+            continue;
+        }
+        return { .body_len = decoded, .leftover = left };
+    }
+}
+
+// Close-delimited body (HTTP/1.0 style): no Content-Length, not chunked. Read until EOF.
+// Never poolable (the framing boundary is the connection close itself), so leftover is 0.
+fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* received) @private
+{
+    while (true)
+    {
+        w.ensure_capacity(w.index + 4096)!;
+        sz? nr = read_into(conn, w, received);
+        if (catch e = nr) return e~;
+        sz n = nr;
+        if (n == 0) break;
+    }
+    return { .body_len = (usz)w.index - consumed, .leftover = 0 };
+}
+
 <* Read one HTTP/1.1 response from `conn` into a single owned buffer (Response.raw).
 
    The header block is read incrementally, then the body is consumed by its declared
@@ -152,79 +230,29 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     bool resp_keepalive = has_connection_token(presp.headers, "keep-alive");
     int minor_version = presp.minor_version;
 
-    // PHASE 2: consume exactly the framed body. `have` = body bytes already buffered.
-    usz have = (usz)w.index - consumed;
-    usz body_len = 0;
-    usz leftover = 0;
+    // PHASE 2: consume exactly the framed body, dispatching to the matching strategy.
+    // Each helper leaves w.index at consumed + body_len and returns the body length plus
+    // any trailing bytes buffered past the message end. The bodiless case stays inline:
+    // there is nothing to read, and every already-buffered byte is leftover.
+    BodyFrame frame;
     if (bodiless)
     {
-        body_len = 0;
-        leftover = have;
+        frame = { .body_len = 0, .leftover = (usz)w.index - consumed };
     }
     else if (content_length >= 0)
     {
-        while (have < (usz)content_length)
-        {
-            w.ensure_capacity((sz)(consumed + (usz)content_length))!;
-            sz? nr = read_into(conn, &w, &received);   // read into the spare capacity
-            if (catch e = nr) return e~;
-            sz n = nr;
-            if (n == 0) return INCOMPLETE_RESPONSE~;   // fewer bytes than Content-Length before EOF
-            have = (usz)w.index - consumed;
-        }
-        body_len = (usz)content_length;
-        leftover = have - body_len;
-        w.index = (sz)(consumed + body_len);   // drop any trailing (pipelined) bytes
+        frame = read_body_content_length(conn, &w, consumed, (usz)content_length, &received)!;
     }
     else if (is_chunked)
     {
-        // Incremental in-place decode: each pass feeds only the newly-read bytes and
-        // appends decoded output right after the previously-decoded region. Recompute
-        // the base slice from array_view() every pass because ensure_capacity may move
-        // the buffer. The decoder only ever rewrites raw[consumed..]; header bytes stay put.
-        httpparser::ChunkedDecoder dec = { .consume_trailer = true };
-        usz decoded = 0;
-        usz seg = have;
-        while (true)
-        {
-            usz seg2 = seg;
-            usz? left = httpparser::decode_chunked(&dec, ((w.array_view())[consumed..])[decoded..], &seg2);
-            decoded += seg2;
-            w.index = (sz)(consumed + decoded);
-            if (catch e2 = left)
-            {
-                if (e2 == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
-                // INCOMPLETE: append more chunk bytes past the decoded region and decode
-                // again. w.index (== consumed+decoded here) must advance by the bytes read
-                // so the next array_view() exposes them as the new segment.
-                w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
-                sz? nr = read_into(conn, &w, &received);
-                if (catch e = nr) return e~;
-                sz n = nr;
-                if (n == 0) return INCOMPLETE_RESPONSE~;   // EOF mid-chunk
-                seg = (usz)n;
-                continue;
-            }
-            body_len = decoded;
-            leftover = left;
-            break;
-        }
+        frame = read_body_chunked(conn, &w, consumed, &received)!;
     }
     else
     {
-        // Close-delimited (HTTP/1.0 style): no Content-Length, not chunked. Read until
-        // EOF. Never poolable (the framing boundary is the connection close itself).
-        while (true)
-        {
-            w.ensure_capacity(w.index + 4096)!;
-            sz? nr = read_into(conn, &w, &received);
-            if (catch e = nr) return e~;
-            sz n = nr;
-            if (n == 0) break;
-        }
-        body_len = (usz)w.index - consumed;
-        leftover = 0;
+        frame = read_body_to_eof(conn, &w, consumed, &received)!;
     }
+    usz body_len = frame.body_len;
+    usz leftover = frame.leftover;
 
     // PHASE 3 (R13): shrink the power-of-two over-allocation, keeping w.bytes in sync so
     // the defer-catch frees the right (possibly moved) pointer and every slice derives from it.
