@@ -103,6 +103,8 @@ fn void? TlsConn.close(&self) @dynamic
 fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration timeout = time::DURATION_ZERO)
 {
     // Reuse the plain dial for the TCP connect (timeout, TCP_NODELAY, fault map).
+    bool verify = !config.no_verify;
+
     PlainConn pc = dial(host, port, timeout)!;
     TcpSocket sock = pc.sock;
     defer catch (void)sock.close();
@@ -111,11 +113,7 @@ fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration time
     if (ctx == null) return TLS_FAILED~;
     defer catch ssl_ctx_free(ctx);
 
-    if (config.no_verify)
-    {
-        ssl_ctx_set_verify(ctx, SSL_VERIFY_NONE, null);
-    }
-    else
+    if (verify)
     {
         ssl_ctx_set_verify(ctx, SSL_VERIFY_PEER, null);
         if (config.ca_file.len != 0 || config.ca_path.len != 0)
@@ -129,6 +127,10 @@ fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration time
             if (ssl_ctx_set_default_verify_paths(ctx) != 1) return TLS_FAILED~;
         }
     }
+    else
+    {
+        ssl_ctx_set_verify(ctx, SSL_VERIFY_NONE, null);
+    }
 
     Ssl ssl = ssl_new(ctx);
     if (ssl == null) return TLS_FAILED~;
@@ -138,10 +140,10 @@ fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration time
 
     ZString host_z = host.zstr_tcopy();
     ssl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, (void*)host_z);   // SNI
-    if (!config.no_verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // hostname check
+    if (verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // hostname check
 
     if (ssl_connect(ssl) != 1) return TLS_HANDSHAKE_FAILED~;
-    if (!config.no_verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
+    if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
 
     return { .sock = sock, .ctx = ctx, .ssl = ssl };
 }
