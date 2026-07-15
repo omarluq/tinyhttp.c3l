@@ -19,6 +19,7 @@ struct Client
     Duration  timeout;
     TlsConfig tls;          // applied to https:// requests (default: verify vs the system CA bundle)
     ConnPool  pool;         // keep-alive pool of idle connections, keyed by scheme|host|port
+    SslCtx    tls_ctx;      // shared long-lived SSL_CTX for https dials, built lazily on first use
 }
 
 <* Create a client. *>
@@ -121,7 +122,10 @@ fn Response? Client.exchange_and_settle(&self, String key, IdleConn ic, Method m
    cleanup. *>
 fn void Client.close(&self)
 {
+    // Free pooled sockets first, then the shared ctx AFTER, so it outlives every
+    // SSL layered over it.
     self.pool.free();
+    if (self.tls_ctx != null) { ssl_ctx_free(self.tls_ctx); self.tls_ctx = (SslCtx)null; }
 }
 
 <* Compose the transient pool key "scheme|host|port". The key lives in `tmem`;
@@ -136,9 +140,12 @@ fn IdleConn? Client.dial_idle(&self, bool is_https, String host, int port) @priv
 {
     if (is_https)
     {
+        // One shared, long-lived ctx per Client (its TlsConfig is fixed); pooled
+        // TlsConns borrow it (owns_ctx = false) and Client.close frees it.
+        if (self.tls_ctx == null) self.tls_ctx = make_ctx(self.tls)!;
         TlsConn* c = alloc::new(self.allocator, TlsConn);
         defer catch alloc::free(self.allocator, c);
-        *c = dial_tls(host, port, self.tls, self.timeout)!;
+        *c = dial_tls_ctx(self.tls_ctx, !self.tls.no_verify, host, port, self.timeout)!;
         return { .conn = (Conn)c, .mem = c };
     }
     PlainConn* c = alloc::new(self.allocator, PlainConn);

@@ -57,12 +57,14 @@ struct TlsConfig
 
 <* A TLS connection: a TCP socket with an OpenSSL session layered on top.
    Implements the same `Conn` seam as `PlainConn`, so nothing above the transport
-   layer changes. *>
+   layer changes. `owns_ctx` is true only for a one-shot conn that built its own
+   `ctx`; pooled conns share a Client-owned ctx and leave it for the Client to free. *>
 struct TlsConn (Conn)
 {
     TcpSocket sock;
     SslCtx    ctx;
     Ssl       ssl;
+    bool      owns_ctx;
 }
 
 fn sz? TlsConn.read(&self, char[] buf) @dynamic
@@ -92,22 +94,19 @@ fn void? TlsConn.write_byte(&self, char c) @dynamic => io::write_byte_using_writ
 fn void? TlsConn.close(&self) @dynamic
 {
     if (self.ssl != null) { ssl_shutdown(self.ssl); ssl_free(self.ssl); self.ssl = (Ssl)null; }
-    if (self.ctx != null) { ssl_ctx_free(self.ctx); self.ctx = (SslCtx)null; }
+    if (self.owns_ctx && self.ctx != null) { ssl_ctx_free(self.ctx); self.ctx = (SslCtx)null; }
     return self.sock.close();
 }
 
 // ---- dial ------------------------------------------------------------------
 
-<* Open a TLS connection to host:port and perform the handshake (SNI = host,
-   hostname verified). `timeout` bounds the TCP connect (0 = block indefinitely). *>
-fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration timeout = time::DURATION_ZERO)
+<* Build a client `SSL_CTX` from `config`: method + verify mode + trust store.
+   An `SSL_CTX` is meant to be long-lived and shared across many short-lived SSL
+   sessions, so build it once and reuse it; the caller owns the returned handle
+   and must `ssl_ctx_free` it once every SSL layered over it is gone. *>
+fn SslCtx? make_ctx(TlsConfig config) @private
 {
-    // Reuse the plain dial for the TCP connect (timeout, TCP_NODELAY, fault map).
     bool verify = !config.no_verify;
-
-    PlainConn pc = dial(host, port, timeout)!;
-    TcpSocket sock = pc.sock;
-    defer catch (void)sock.close();
 
     SslCtx ctx = ssl_ctx_new(tls_client_method());
     if (ctx == null) return TLS_FAILED~;
@@ -131,6 +130,20 @@ fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration time
     {
         ssl_ctx_set_verify(ctx, SSL_VERIFY_NONE, null);
     }
+    return ctx;
+}
+
+<* Open a TLS connection to host:port over a pre-built shared `ctx` and perform the
+   handshake (SNI = host, hostname verified when `verify`). The SNI/hostname checks
+   are per-SSL, so the ctx is safely shared. The returned TlsConn does NOT own `ctx`
+   (owns_ctx = false): the caller keeps `ctx` alive for the connection's lifetime and
+   frees it after every SSL over it is gone. `timeout` bounds the TCP connect. *>
+fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Duration timeout = time::DURATION_ZERO) @private
+{
+    // Reuse the plain dial for the TCP connect (timeout, TCP_NODELAY, fault map).
+    PlainConn pc = dial(host, port, timeout)!;
+    TcpSocket sock = pc.sock;
+    defer catch (void)sock.close();
 
     Ssl ssl = ssl_new(ctx);
     if (ssl == null) return TLS_FAILED~;
@@ -145,5 +158,19 @@ fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration time
     if (ssl_connect(ssl) != 1) return TLS_HANDSHAKE_FAILED~;
     if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
 
-    return { .sock = sock, .ctx = ctx, .ssl = ssl };
+    return { .sock = sock, .ctx = ctx, .ssl = ssl, .owns_ctx = false };
+}
+
+<* Open a TLS connection to host:port and perform the handshake (SNI = host,
+   hostname verified). Builds a private `SSL_CTX` owned by the returned conn, so it
+   is self-contained for one-shot use; the Client keep-alive path shares one ctx via
+   `make_ctx` + `dial_tls_ctx`. `timeout` bounds the TCP connect (0 = block indefinitely). *>
+fn TlsConn? dial_tls(String host, int port, TlsConfig config = {}, Duration timeout = time::DURATION_ZERO)
+{
+    SslCtx ctx = make_ctx(config)!;
+    defer catch ssl_ctx_free(ctx);
+
+    TlsConn tc = dial_tls_ctx(ctx, !config.no_verify, host, port, timeout)!;
+    tc.owns_ctx = true;
+    return tc;
 }
