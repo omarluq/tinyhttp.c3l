@@ -242,12 +242,11 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
         is_chunked = te_is_chunked(presp.headers);
         if (!is_chunked)
         {
-            String cl = find_header(presp.headers, "Content-Length");
-            if (cl.len != 0)
+            long clv = content_length_header(presp.headers)!;   // -1 when absent; faults on conflicting duplicate fields
+            if (clv >= 0)
             {
-                ulong clv = cl.to_ulong() ?? MALFORMED_RESPONSE~!;
-                if (clv > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;   // cap the DECLARED length before it sizes the buffer
-                content_length = (long)clv;                                 // now provably >= 0, so framing is never mis-read
+                if ((ulong)clv > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;   // cap the DECLARED length before it sizes the buffer
+                content_length = clv;                                             // now provably >= 0, so framing is never mis-read
             }
         }
     }

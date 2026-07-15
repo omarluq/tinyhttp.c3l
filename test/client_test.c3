@@ -314,6 +314,39 @@ fn void test_content_length_declared_cap() @test
     assert(false, "over-cap Content-Length should be rejected");
 }
 
+// Issue #2: two Content-Length fields with DIFFERING values are unrecoverable
+// (RFC 7230 §3.3.3 rule 4). Framing on the first value alone would read 10 bytes
+// and buffer the rest as leftover — a response-smuggling primitive — so this
+// must fault MALFORMED_RESPONSE rather than succeed.
+fn void test_conflicting_content_length_rejected() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 9999\r\n\r\n0123456789the rest is smuggled");
+    defer m.written.free();
+
+    Response? r = send(mem, &m, GET, "x", "/");
+    if (catch err = r)
+    {
+        assert(err == MALFORMED_RESPONSE);
+        return;
+    }
+    r.free();
+    assert(false, "conflicting Content-Length values should fault MALFORMED_RESPONSE");
+}
+
+// Issue #2: identical duplicate Content-Length fields agree, so framing proceeds
+// on the shared value (RFC allows identical duplicates).
+fn void test_duplicate_identical_content_length_ok() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 200);
+    assert(resp.body == "hello");
+}
+
 // #7: a Transfer-Encoding list (last token "chunked") still de-chunks the body.
 fn void test_transfer_encoding_list_chunked() @test
 {
