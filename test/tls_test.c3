@@ -13,6 +13,20 @@ fn void test_openssl_links() @test
     ssl_ctx_free(ctx);
 }
 
+// ip_literal classifies hosts: IP literals (including bracketed IPv6) select the
+// iPAddress-SAN verification path with brackets stripped; hostnames fault so the
+// SNI + hostname-check path is used instead.
+fn void test_ip_literal() @test
+{
+    assert(ip_literal("127.0.0.1")!! == "127.0.0.1");
+    assert(ip_literal("192.168.1.1")!! == "192.168.1.1");
+    assert(ip_literal("::1")!! == "::1");
+    assert(ip_literal("[::1]")!! == "::1");                     // URL-form IPv6 unwrapped
+    assert(ip_literal("[2001:db8::1]")!! == "2001:db8::1");
+    assert(!@ok(ip_literal("example.com")));                   // hostname -> fault
+    assert(!@ok(ip_literal("localhost")));
+}
+
 // Live end-to-end HTTPS round-trip: real handshake + certificate verification vs
 // the system trust store, then a decrypted 200 response. Gated on TINYHTTP_LIVE
 // (needs a network), so the default `compile-test` stays offline.

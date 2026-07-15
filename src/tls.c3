@@ -6,14 +6,16 @@
 
 module tinyhttp;
 import std::io;
+import std::net;
 import std::net::tcp;
 import std::time;
 
 // ---- OpenSSL bindings (the library heap-allocates every handle) ------------
 
-typedef SslMethod @private = inline void*;   // const SSL_METHOD*
-typedef SslCtx    @private = inline void*;   // SSL_CTX*
-typedef Ssl       @private = inline void*;   // SSL*
+typedef SslMethod       @private = inline void*;   // const SSL_METHOD*
+typedef SslCtx          @private = inline void*;   // SSL_CTX*
+typedef Ssl             @private = inline void*;   // SSL*
+typedef X509VerifyParam @private = inline void*;   // X509_VERIFY_PARAM*
 
 const CInt  SSL_VERIFY_NONE              @private = 0x00;
 const CInt  SSL_VERIFY_PEER              @private = 0x01;
@@ -33,6 +35,8 @@ extern fn Ssl       ssl_new(SslCtx ctx) @cname("SSL_new") @private;
 extern fn void      ssl_free(Ssl ssl) @cname("SSL_free") @private;
 extern fn CInt      ssl_set_fd(Ssl ssl, CInt fd) @cname("SSL_set_fd") @private;
 extern fn CInt      ssl_set1_host(Ssl ssl, ZString host) @cname("SSL_set1_host") @private;
+extern fn X509VerifyParam ssl_get0_param(Ssl ssl) @cname("SSL_get0_param") @private;
+extern fn CInt      x509_verify_param_set1_ip_asc(X509VerifyParam param, ZString ipasc) @cname("X509_VERIFY_PARAM_set1_ip_asc") @private;
 extern fn CLong     ssl_ctrl(Ssl ssl, CInt cmd, CLong larg, void* parg) @cname("SSL_ctrl") @private;
 extern fn CInt      ssl_connect(Ssl ssl) @cname("SSL_connect") @private;
 extern fn CLong     ssl_get_verify_result(Ssl ssl) @cname("SSL_get_verify_result") @private;
@@ -133,6 +137,19 @@ fn SslCtx? make_ctx(TlsConfig config) @private
     return ctx;
 }
 
+<* If `host` is an IP literal, return the bare IP text (IPv6 brackets stripped) for
+   `X509_VERIFY_PARAM_set1_ip_asc`; otherwise fault. Lets `dial_tls_ctx` verify an
+   `https://<ip>/` peer against the certificate's iPAddress SAN rather than a
+   hostname, which OpenSSL only matches against dNSName SANs / CN. *>
+fn String? ip_literal(String host) @private
+{
+    String s = host;
+    if (s.len >= 2 && s[0] == '[' && s[^1] == ']') s = s[1 .. ^2];   // [::1] -> ::1
+    if (try net::ipv4_from_str(s)) return s;
+    net::ipv6_from_str(s)!;   // rethrows INVALID_IP_STRING when host is not an IP literal
+    return s;
+}
+
 <* Open a TLS connection to host:port over a pre-built shared `ctx` and perform the
    handshake (SNI = host, hostname verified when `verify`). The SNI/hostname checks
    are per-SSL, so the ctx is safely shared. The returned TlsConn does NOT own `ctx`
@@ -151,9 +168,22 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Duratio
 
     if (ssl_set_fd(ssl, (CInt)sock.sock) != 1) return TLS_FAILED~;
 
-    ZString host_z = host.zstr_tcopy();
-    ssl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, (void*)host_z);   // SNI
-    if (verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // hostname check
+    if (try String ip = ip_literal(host))
+    {
+        // IP literal: OpenSSL's X509_check_host never matches an IP against a
+        // dNSName SAN or CN, so verify against the cert's iPAddress SAN instead,
+        // and skip SNI entirely (RFC 6066 forbids an IP-literal server name).
+        if (verify && x509_verify_param_set1_ip_asc(ssl_get0_param(ssl), ip.zstr_tcopy()) != 1)
+        {
+            return TLS_HANDSHAKE_FAILED~;
+        }
+    }
+    else
+    {
+        ZString host_z = host.zstr_tcopy();
+        ssl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, (void*)host_z);   // SNI
+        if (verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~;   // hostname check
+    }
 
     if (ssl_connect(ssl) != 1) return TLS_HANDSHAKE_FAILED~;
     if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
