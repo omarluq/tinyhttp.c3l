@@ -16,11 +16,12 @@ struct Client
     String    base_url;
     Header[]  default_headers;
     Duration  timeout;
+    TlsConfig tls;          // applied to https:// requests (default: verify vs the system CA bundle)
 }
 
 <* Create a client. *>
-fn Client client(Allocator allocator, String base_url = "", Header[] default_headers = {}, Duration timeout = time::DURATION_ZERO)
-    => { .allocator = allocator, .base_url = base_url, .default_headers = default_headers, .timeout = timeout };
+fn Client client(Allocator allocator, String base_url = "", Header[] default_headers = {}, Duration timeout = time::DURATION_ZERO, TlsConfig tls = {})
+    => { .allocator = allocator, .base_url = base_url, .default_headers = default_headers, .timeout = timeout, .tls = tls };
 
 <* Append `src` into `dst` starting at `count`; raise TOO_MANY_HEADERS if they
    would not all fit. Returns the new count. *>
@@ -63,7 +64,7 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     Header[MAX_HEADERS] merged;
     usz m = merge_headers(merged[..], self.default_headers, headers)!;
 
-    return request_url(method, url, merged[:m], body, self.timeout, self.allocator);
+    return request_url(method, url, merged[:m], body, self.timeout, self.allocator, self.tls);
 }
 
 <* GET base_url+path with the default headers merged with `headers`. *>

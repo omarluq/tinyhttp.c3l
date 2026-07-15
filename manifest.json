@@ -56,8 +56,9 @@
       "link-args" : [],
       // C3 libraries this target depends on:
       "dependencies" : [],
-      // The external libraries to link for this target:
-      "linked-libraries" : []
+      // The external libraries to link for this target — the system OpenSSL
+      // (libssl/libcrypto), provided by the consumer's system:
+      "linked-libraries" : [ "ssl", "crypto" ]
     },
     "macos-aarch64" : {
       // Extra flags to the linker for this target:

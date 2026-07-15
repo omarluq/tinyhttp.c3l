@@ -16,7 +16,7 @@ import std::net::url;
 import std::time;
 
 faultdef
-    UNSUPPORTED_SCHEME,   // only http:// so far
+    UNSUPPORTED_SCHEME,   // scheme is neither http:// nor https://
     CONNECT_FAILED,       // could not reach the peer
     TIMEOUT,              // connect timed out
     DNS_FAILED,           // host name / address resolution failed
@@ -25,11 +25,14 @@ faultdef
     RESPONSE_TOO_LARGE,   // response exceeded MAX_RESPONSE_BYTES
     MALFORMED_RESPONSE,   // response could not be parsed
     INVALID_URL,          // url could not be parsed into a usable http:// target
-    INCOMPLETE_RESPONSE;  // Content-Length exceeded the bytes received before EOF
+    INCOMPLETE_RESPONSE,  // Content-Length exceeded the bytes received before EOF
+    TLS_FAILED,           // TLS setup, read, or write failed
+    TLS_HANDSHAKE_FAILED; // TLS handshake or certificate verification failed
 
 const usz MAX_RESPONSE_HEADERS @private = 100;
 const usz MAX_RESPONSE_BYTES @private = 32 * 1024 * 1024;
 const int DEFAULT_HTTP_PORT @private = 80;
+const int DEFAULT_HTTPS_PORT @private = 443;
 
 <* Send a request over an already-open connection and read the response. The
    low-level entry point: convenience wrappers and `Client` build on it, and
@@ -140,46 +143,55 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method) @priva
 
 // ---- convenience wrappers (open a connection, send, close) ------------------
 
-<* Parse `url_str` (must be http://) into the connect `Url`, the RFC 7230 §5.4
+<* Parse `url_str` (must be http:// or https://) into the connect `Url`, the RFC 7230 §5.4
    Host header value (host, plus non-default port), and the request-target
    (percent-re-encoded path + raw query). *>
 fn void? make_request_target(String url_str, Url* u, String* host_hdr, String* target) @private
 {
     *u = url::parse(tmem, url_str) ?? INVALID_URL~!;   // maps url faults (incl. EMPTY on "") to INVALID_URL
-    if (!ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
-    int port = u.port ?: DEFAULT_HTTP_PORT;
-    *host_hdr = port == DEFAULT_HTTP_PORT ? u.host : string::tformat("%s:%d", u.host, port);
+    bool is_https = ci_eq(u.scheme, "https");
+    if (!is_https && !ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
+    int default_port = is_https ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT;
+    int port = u.port ?: default_port;
+    *host_hdr = port == default_port ? u.host : string::tformat("%s:%d", u.host, port);
     String path = u.path.len != 0 ? url::tencode(u.path, url::UrlEncodingMode.PATH) : "/";  // re-encode path
     if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);                   // query left un-decoded by url::parse
     *target = path;
 }
 
-<* Perform `method url_str` over a fresh connection. `url_str` must be http://. *>
-fn Response? request_url(Method method, String url_str, Header[] headers = {}, char[] body = {}, Duration timeout = time::DURATION_ZERO, Allocator allocator = tmem)
+<* Perform `method url_str` over a fresh connection. `url_str` must be http:// or https://. *>
+fn Response? request_url(Method method, String url_str, Header[] headers = {}, char[] body = {}, Duration timeout = time::DURATION_ZERO, Allocator allocator = tmem, TlsConfig tls = {})
 {
     Url u; String host_hdr; String target;
     make_request_target(url_str, &u, &host_hdr, &target)!;
+    if (ci_eq(u.scheme, "https"))
+    {
+        int tls_port = u.port ?: DEFAULT_HTTPS_PORT;
+        TlsConn conn = dial_tls(u.host, tls_port, tls, timeout)!;
+        defer (void)conn.close();
+        return send(allocator, &conn, method, host_hdr, target, headers, body);
+    }
     int port = u.port ?: DEFAULT_HTTP_PORT;
     PlainConn conn = dial(u.host, port, timeout)!;
     defer (void)conn.close();
     return send(allocator, &conn, method, host_hdr, target, headers, body);
 }
 
-<* Perform `GET url` over a fresh connection. `url` must be http://. *>
+<* Perform `GET url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? get(String url, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(GET, url, headers, allocator: allocator);
-<* Perform `HEAD url` over a fresh connection. `url` must be http://. *>
+<* Perform `HEAD url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? head(String url, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(HEAD, url, headers, allocator: allocator);
-<* Perform `DELETE url` over a fresh connection. `url` must be http://. *>
+<* Perform `DELETE url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? delete(String url, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(DELETE, url, headers, allocator: allocator);
-<* Perform `POST url` with `body` over a fresh connection. `url` must be http://. *>
+<* Perform `POST url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? post(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(POST, url, headers, body, allocator: allocator);
-<* Perform `PUT url` with `body` over a fresh connection. `url` must be http://. *>
+<* Perform `PUT url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? put(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(PUT, url, headers, body, allocator: allocator);
-<* Perform `PATCH url` with `body` over a fresh connection. `url` must be http://. *>
+<* Perform `PATCH url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? patch(String url, char[] body, Header[] headers = {}, Allocator allocator = tmem)
     => request_url(PATCH, url, headers, body, allocator: allocator);
