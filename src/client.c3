@@ -168,6 +168,10 @@ fn Response? Client.head(&self, String path, Header[] headers = {})
 fn Response? Client.delete(&self, String path, Header[] headers = {})
     => self.request(DELETE, path, headers);
 
+<* OPTIONS base_url+path with the default headers merged with `headers`. *>
+fn Response? Client.options(&self, String path, Header[] headers = {})
+    => self.request(OPTIONS, path, headers);
+
 <* POST `body` to base_url+path with the default headers merged with `headers`. *>
 fn Response? Client.post(&self, String path, char[] body, Header[] headers = {})
     => self.request(POST, path, headers, body);

@@ -90,6 +90,22 @@ fn void test_send_content_length() @test
     assert(req.contains("Connection: close\r\n"));
 }
 
+fn void test_send_options_method() @test
+{
+    // OPTIONS is a no-body method: its wire name must render on the request line.
+    MockConn m = mock("HTTP/1.1 204 No Content\r\nAllow: GET, POST, OPTIONS\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, OPTIONS, "example.com", "*")!!;
+    defer resp.free();
+
+    assert(resp.status == 204);
+    assert(resp.header("Allow") == "GET, POST, OPTIONS");
+
+    String req = m.written.str_view();
+    assert(req.contains("OPTIONS * HTTP/1.1\r\n"));
+}
+
 fn void test_send_chunked() @test
 {
     MockConn m = mock("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n5\r\nhello\r\n0\r\n\r\n");
