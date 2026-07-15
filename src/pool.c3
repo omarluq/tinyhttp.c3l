@@ -37,7 +37,7 @@ fn IdleConn? ConnPool.checkout(&self, String key) @private
     if (!self.inited) return POOL_EMPTY~;
     if (try list = self.map.get_ref(key))
     {
-        if (list.len() > 0) return list.pop();
+        if (try ic = list.pop()) return ic;
     }
     return POOL_EMPTY~;
 }
