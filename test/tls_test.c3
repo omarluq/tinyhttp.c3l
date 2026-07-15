@@ -8,9 +8,9 @@ import std::os::env;
 // network — just proves the bindings resolve and OpenSSL is usable.
 fn void test_openssl_links() @test
 {
-    SslCtx ctx = ssl_ctx_new(tls_client_method());
-    assert(ctx != null);
-    ssl_ctx_free(ctx);
+	SslCtx ctx = ssl_ctx_new(tls_client_method());
+	assert(ctx != null);
+	ssl_ctx_free(ctx);
 }
 
 // ip_literal classifies hosts: IP literals (including bracketed IPv6) select the
@@ -18,13 +18,13 @@ fn void test_openssl_links() @test
 // SNI + hostname-check path is used instead.
 fn void test_ip_literal() @test
 {
-    assert(ip_literal("127.0.0.1")!! == "127.0.0.1");
-    assert(ip_literal("192.168.1.1")!! == "192.168.1.1");
-    assert(ip_literal("::1")!! == "::1");
-    assert(ip_literal("[::1]")!! == "::1");                     // URL-form IPv6 unwrapped
-    assert(ip_literal("[2001:db8::1]")!! == "2001:db8::1");
-    assert(!@ok(ip_literal("example.com")));                   // hostname -> fault
-    assert(!@ok(ip_literal("localhost")));
+	assert(ip_literal("127.0.0.1")!! == "127.0.0.1");
+	assert(ip_literal("192.168.1.1")!! == "192.168.1.1");
+	assert(ip_literal("::1")!! == "::1");
+	assert(ip_literal("[::1]")!! == "::1"); // URL-form IPv6 unwrapped
+	assert(ip_literal("[2001:db8::1]")!! == "2001:db8::1");
+	assert(!@ok(ip_literal("example.com"))); // hostname -> fault
+	assert(!@ok(ip_literal("localhost")));
 }
 
 // A zero-length read/write must return 0 without invoking OpenSSL, matching
@@ -32,10 +32,10 @@ fn void test_ip_literal() @test
 // The 0-len guard returns before touching self.ssl, so a null-ssl conn is safe.
 fn void test_zero_length_io() @test
 {
-    TlsConn tc = {};   // ssl == null; guards short-circuit before any OpenSSL call
-    char[] empty = {};
-    assert(tc.write(empty)!! == 0);
-    assert(tc.read(empty)!! == 0);
+	TlsConn tc   = { }; // ssl == null; guards short-circuit before any OpenSSL call
+	char[] empty = { };
+	assert(tc.write(empty)!! == 0);
+	assert(tc.read(empty)!! == 0);
 }
 
 // Live end-to-end HTTPS round-trip: real handshake + certificate verification vs
@@ -43,11 +43,11 @@ fn void test_zero_length_io() @test
 // (needs a network), so the default `compile-test` stays offline.
 fn void test_https_live() @test
 {
-    if (catch env::tget_var("TINYHTTP_LIVE")) return;   // skip unless explicitly enabled
+	if (catch env::tget_var("TINYHTTP_LIVE")) return; // skip unless explicitly enabled
 
-    Response resp = get("https://example.com")!!;
-    defer resp.free();
-    assert(resp.status == 200);
-    assert(resp.ok());
-    assert(resp.body.len > 0);
+	Response resp = get("https://example.com")!!;
+	defer resp.free();
+	assert(resp.status == 200);
+	assert(resp.ok());
+	assert(resp.body.len > 0);
 }
