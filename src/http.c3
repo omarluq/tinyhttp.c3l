@@ -138,9 +138,8 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
             }
         }
     }
-    String conn_hdr = find_header(presp.headers, "Connection");
-    bool resp_close = conn_has_token(conn_hdr, "close");
-    bool resp_keepalive = conn_has_token(conn_hdr, "keep-alive");
+    bool resp_close = has_connection_token(presp.headers, "close");
+    bool resp_keepalive = has_connection_token(presp.headers, "keep-alive");
     int minor_version = presp.minor_version;
 
     // PHASE 2: consume exactly the framed body. `have` = body bytes already buffered.

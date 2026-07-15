@@ -37,9 +37,13 @@ fn bool conn_has_token(String value, String token) @private
     return false;
 }
 
-// True if any Connection header carries the "close" token.
-fn bool has_connection_close(Header[] headers) @private
+// True if any Connection header line carries the given token. Scans ALL
+// Connection headers, so a later "close" is never masked by an earlier line.
+fn bool has_connection_token(Header[] headers, String token) @private
 {
-    foreach (&h : headers) if (ci_eq(h.name, "Connection") && conn_has_token((String)h.value, "close")) return true;
+    foreach (&h : headers) if (ci_eq(h.name, "Connection") && conn_has_token((String)h.value, token)) return true;
     return false;
 }
+
+// True if any Connection header carries the "close" token.
+fn bool has_connection_close(Header[] headers) @private => has_connection_token(headers, "close");
