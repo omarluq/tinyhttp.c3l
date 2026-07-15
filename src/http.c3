@@ -47,6 +47,19 @@ fn Response? send(Allocator allocator, Conn conn, Method method, String host, St
     return read_response(allocator, conn, method);
 }
 
+// Read once into the ByteWriter's spare capacity, advance the write cursor, tally
+// the cumulative byte count and enforce MAX_RESPONSE_BYTES. Returns the byte count
+// (0 == EOF); a read fault propagates and a size-cap breach raises RESPONSE_TOO_LARGE.
+// Callers own their ensure_capacity call (site-specific) and their own n==0 reaction.
+fn sz? read_into(Conn conn, ByteWriter* w, usz* received) @private
+{
+    sz n = conn.read(w.bytes[w.index..])!;
+    w.index += n;
+    *received += (usz)n;
+    if (*received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
+    return n;
+}
+
 <* Read one HTTP/1.1 response from `conn` into a single owned buffer (Response.raw).
 
    The header block is read incrementally, then the body is consumed by its declared
@@ -77,7 +90,7 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     while (true)
     {
         w.ensure_capacity(w.index + 4096)!;
-        sz? nr = conn.read(w.bytes[w.index..]);
+        sz? nr = read_into(conn, &w, &received);
         if (catch e = nr)
         {
             if (reused && w.index == 0) return STALE_CONNECTION~;   // idle keep-alive conn was closed
@@ -89,9 +102,6 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
             if (reused && w.index == 0) return STALE_CONNECTION~;
             return MALFORMED_RESPONSE~;                             // EOF before a complete header block
         }
-        w.index += n;
-        received += (usz)n;
-        if (received > MAX_RESPONSE_BYTES || (usz)w.index > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
 
         usz? c = httpparser::parse_response(w.array_view(), &presp, hstore[..], last);
         if (catch pe = c)
@@ -156,13 +166,10 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
         while (have < (usz)content_length)
         {
             w.ensure_capacity((sz)(consumed + (usz)content_length))!;
-            sz? nr = conn.read(w.bytes[w.index..]);   // read into the spare capacity
+            sz? nr = read_into(conn, &w, &received);   // read into the spare capacity
             if (catch e = nr) return e~;
             sz n = nr;
             if (n == 0) return INCOMPLETE_RESPONSE~;   // fewer bytes than Content-Length before EOF
-            w.index += n;
-            received += (usz)n;
-            if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
             have = (usz)w.index - consumed;
         }
         body_len = (usz)content_length;
@@ -191,13 +198,10 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
                 // again. w.index (== consumed+decoded here) must advance by the bytes read
                 // so the next array_view() exposes them as the new segment.
                 w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
-                sz? nr = conn.read(w.bytes[w.index..]);
+                sz? nr = read_into(conn, &w, &received);
                 if (catch e = nr) return e~;
                 sz n = nr;
                 if (n == 0) return INCOMPLETE_RESPONSE~;   // EOF mid-chunk
-                w.index += n;
-                received += (usz)n;
-                if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
                 seg = (usz)n;
                 continue;
             }
@@ -213,13 +217,10 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
         while (true)
         {
             w.ensure_capacity(w.index + 4096)!;
-            sz? nr = conn.read(w.bytes[w.index..]);
+            sz? nr = read_into(conn, &w, &received);
             if (catch e = nr) return e~;
             sz n = nr;
             if (n == 0) break;
-            w.index += n;
-            received += (usz)n;
-            if (received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
         }
         body_len = (usz)w.index - consumed;
         leftover = 0;
