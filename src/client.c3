@@ -66,8 +66,11 @@ fn usz? merge_headers(Header[] dst, Header[] defaults, Header[] overrides) @priv
    socket), otherwise a fresh connection is dialed. A precisely-delimited,
    still-persistent response returns its conn to the pool; anything else closes
    it. Call `close` when done to release pooled sockets. *>
-fn Response? Client.request(&self, Method method, String path, Header[] headers = {}, char[] body = {})
+fn Response? Client.request(&self, Method method, String path, Header[] headers = {}, char[] body = {}) => @pool()
 {
+    // Reset the per-request transient churn (url parse, host/target formatting,
+    // pool key) on every exit path; everything that outlives the call lives on
+    // self.allocator.
     String url = self.base_url.len != 0 ? self.base_url.tconcat(path) : path;
 
     Header[MAX_HEADERS] merged;
