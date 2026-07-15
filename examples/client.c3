@@ -1,9 +1,10 @@
 // A reusable Client: a base URL plus default headers applied to every call.
 // 
-// The client holds configuration (allocator, base_url, default headers) and is
-// reused across requests. A per-call header of the same name overrides a
-// default; otherwise the defaults are merged in. Here we make two calls through
-// the same client to show the reuse.
+// The client holds configuration (allocator, base_url, default headers) and a
+// keep-alive connection pool, so the two calls below reuse a single TCP
+// connection instead of dialing twice. A per-call header of the same name
+// overrides a default; otherwise the defaults are merged in. Because the client
+// owns pooled sockets, close() must be called when it is done with.
 
 module examples::client;
 import tinyhttp;
@@ -18,6 +19,7 @@ fn void main()
 
 	// `mem` (the heap allocator) owns the responses, so each is freed explicitly.
 	tinyhttp::Client http = tinyhttp::client(mem, "http://example.com", defaults[..]);
+	defer http.close(); // releases the pooled keep-alive sockets the client owns
 
 	// First call: base_url + "/" with the default User-Agent merged in.
 	tinyhttp::Response? first = http.get("/");

@@ -48,16 +48,21 @@ io::printfn("status: %d", resp.status);
 A `Client` holds a base URL, default headers, and a connect timeout, and applies
 them to every call. A per-call header of the same name overrides a default.
 
+It also keeps a keep-alive connection pool, so repeated calls to the same host
+reuse one connection instead of dialing every time. The client owns those pooled
+sockets, so call `close()` when you are done with it.
+
 ```c3
 Header[1] defaults = { { .name = "Accept", .value = "application/json" } };
 Client client = tinyhttp::client(mem, "https://api.github.com", defaults[..]);
+defer client.close();   // releases the pooled connections
 
 Response? user = client.get("/users/octocat");
 if (catch err = user) return;
 defer user.free();
 io::printfn("status: %d", user.status);
 
-// The same client is reused for the next call.
+// The same client is reused for the next call, over the same connection.
 Response? repos = client.get("/users/octocat/repos");
 if (catch err = repos) return;
 defer repos.free();
@@ -78,10 +83,30 @@ defer resp.free();
 
 ## HTTPS
 
+An `https://` URL selects the TLS transport on its own. The server certificate
+chain and the hostname are verified against the system trust store by default,
+so nothing extra is needed for a normal site.
+
 HTTPS links against the system OpenSSL (`libssl` and `libcrypto`), so those must
 be installed. tinyhttp already names them for `linux-x64` in its manifest. On
 other setups, pass the flags to your linker yourself, for example
 `-l ssl -l crypto`.
+
+Pass a `TlsConfig` to override the trust source, or to skip verification
+(insecure):
+
+```c3
+TlsConfig tls = { .ca_file = "/etc/ssl/certs/ca-certificates.crt" };
+
+// On a Client, applied to every https:// request it makes:
+Client client = tinyhttp::client(mem, "https://example.com", tls: tls);
+defer client.close();
+
+// Or per request, on the builder:
+Response? resp = tinyhttp::request(Method.GET, "https://example.com")
+    .tls(tls)
+    .send();
+```
 
 ## Allocators
 
@@ -107,6 +132,15 @@ if (catch err = resp)
     return;
 }
 defer resp.free();
+```
+
+## Examples
+
+Runnable programs live in [`examples/`](examples): `get`, `https`, `post_json`,
+`headers`, `client`, and `builder`. Build one against the library:
+
+```bash
+c3c compile src/*.c3 examples/get.c3 -l ssl -l crypto -o get
 ```
 
 ## License
