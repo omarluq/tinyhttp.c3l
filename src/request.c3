@@ -38,7 +38,7 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
     if (!has_header(headers, "User-Agent")) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
 
     bool has_content_length = false;
-    foreach (h : headers)
+    foreach (&h : headers)
     {
         String hname = (String)h.name;
         String hvalue = (String)h.value;
