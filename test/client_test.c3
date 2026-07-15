@@ -489,6 +489,24 @@ fn void test_caller_keep_alive_suppressed() @test
     assert(!req.contains("keep-alive"));
 }
 
+// Issue #10: on the pooled path (close:false) a caller Connection: close is
+// honored — it reaches the wire AND marks the connection non-reusable, so the
+// wire and the local reuse decision agree.
+fn void test_pooled_caller_close_honored() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    defer m.written.free();
+
+    Header[1] h = { { .name = "Connection", .value = "close" } };
+    bool reusable = true;
+    Response resp = do_exchange(mem, &m, GET, "x", "/", h[..], {}, false, &reusable)!!;
+    defer resp.free();
+
+    String req = m.written.str_view();
+    assert(req.contains("Connection: close\r\n"));
+    assert(!reusable);
+}
+
 // R2: HEAD carries no body even when headers advertise Content-Length; the
 // bodiless short-circuit succeeds instead of faulting INCOMPLETE_RESPONSE.
 fn void test_head_bodiless() @test

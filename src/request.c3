@@ -28,10 +28,12 @@ fn bool has_crlf(String s) @private => s.contains_char('\r') || s.contains_char(
 
 <* Serialize an HTTP/1.1 request and write it to `conn`. Host, a default
    User-Agent, and Content-Length for a body are each added only if the caller
-   did not already supply them. Connection: close is sent only when `close` is
-   true (the default, used by the one-shot send() path); the pooled/Client path
-   passes close:false so the HTTP/1.1 connection stays persistent. Caller header
-   names/values containing CR or LF fault with INVALID_HEADER. *>
+   did not already supply them. Connection: close is sent when `close` is true
+   (the default, used by the one-shot send() path) OR when the caller supplied a
+   Connection header carrying the close token; the pooled/Client path passes
+   close:false so the HTTP/1.1 connection stays persistent unless the caller asks
+   to close. Caller header names/values containing CR or LF fault with
+   INVALID_HEADER. *>
 fn void? write_request(Conn conn, Method method, String host, String path, Header[] headers, char[] body, bool close = true) @private
 {
     DString req = dstring::temp_with_capacity(256);
@@ -39,7 +41,7 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
 
     req.appendf("%s %s HTTP/1.1\r\n", method.name, path)!;
     if (!has_header(headers, "Host")) req.appendf("Host: %s\r\n", host)!;
-    if (close) req.append_string("Connection: close\r\n");
+    if (close || has_connection_close(headers)) req.append_string("Connection: close\r\n");
     if (!has_header(headers, "User-Agent")) req.appendf("User-Agent: %s\r\n", USER_AGENT)!;
 
     bool has_content_length = false;
