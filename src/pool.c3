@@ -7,18 +7,18 @@ alias IdleList = List{IdleConn};
 alias PoolMap = HashMap{String, IdleList};
 
 // internal miss signal raised by ConnPool.checkout when no idle conn is available
-faultdef POOL_EMPTY;
+faultdef POOL_EMPTY @private;
 
 <* An idle, reusable connection plus the heap allocation backing its fat pointer,
    kept so ConnPool.discard/free can release the concrete object without interface introspection. *>
-struct IdleConn
+struct IdleConn @private
 {
     Conn conn;
     void* mem;
 }
 
 <* Keep-alive connection pool keyed by "scheme|host|port"; each bucket is a LIFO stack of idle connections. *>
-struct ConnPool
+struct ConnPool @private
 {
     Allocator allocator;
     PoolMap map;
