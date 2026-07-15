@@ -243,6 +243,24 @@ fn void test_response_size_cap() @test
     }
 }
 
+// Rank 1: a DECLARED Content-Length over the cap is rejected from the header
+// alone, before it sizes the buffer, so an over-declaration cannot force a giant
+// allocation. The mock sends a 1-byte body but claims ~1 GB.
+fn void test_content_length_declared_cap() @test
+{
+    MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\nx");
+    defer m.written.free();
+
+    Response? r = send(mem, &m, GET, "x", "/");
+    if (catch err = r)
+    {
+        assert(err == RESPONSE_TOO_LARGE);
+        return;
+    }
+    r.free();
+    assert(false, "over-cap Content-Length should be rejected");
+}
+
 // #7: a Transfer-Encoding list (last token "chunked") still de-chunks the body.
 fn void test_transfer_encoding_list_chunked() @test
 {

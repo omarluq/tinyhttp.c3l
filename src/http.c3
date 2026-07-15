@@ -130,7 +130,12 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
         if (!is_chunked)
         {
             String cl = find_header(presp.headers, "Content-Length");
-            if (cl.len != 0) content_length = (long)(cl.to_ulong() ?? MALFORMED_RESPONSE~!);
+            if (cl.len != 0)
+            {
+                ulong clv = cl.to_ulong() ?? MALFORMED_RESPONSE~!;
+                if (clv > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;   // cap the DECLARED length before it sizes the buffer
+                content_length = (long)clv;                                 // now provably >= 0, so framing is never mis-read
+            }
         }
     }
     String conn_hdr = find_header(presp.headers, "Connection");
