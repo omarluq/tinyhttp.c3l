@@ -182,23 +182,21 @@ fn void test_builder() @test
 // decoded CRLF cannot smuggle a literal newline into the request line.
 fn void test_request_target_reencodes_path() @test
 {
-    Url u; String host_hdr; String target;
-    make_request_target("http://h/a%20b", &u, &host_hdr, &target)!!;
-    assert(target == "/a%20b");
+    RequestTarget rt = make_request_target("http://h/a%20b")!!;
+    assert(rt.target == "/a%20b");
 
-    make_request_target("http://h/a%0D%0AEvil:%20x", &u, &host_hdr, &target)!!;
-    assert(!target.contains("\r") && !target.contains("\n"));
+    rt = make_request_target("http://h/a%0D%0AEvil:%20x")!!;
+    assert(!rt.target.contains("\r") && !rt.target.contains("\n"));
 }
 
 // #2: the Host header carries a non-default port but omits the default :80.
 fn void test_host_header_includes_port() @test
 {
-    Url u; String host_hdr; String target;
-    make_request_target("http://example.com:8080/", &u, &host_hdr, &target)!!;
-    assert(host_hdr == "example.com:8080");
+    RequestTarget rt = make_request_target("http://example.com:8080/")!!;
+    assert(rt.host_hdr == "example.com:8080");
 
-    make_request_target("http://example.com/", &u, &host_hdr, &target)!!;
-    assert(host_hdr == "example.com");
+    rt = make_request_target("http://example.com/")!!;
+    assert(rt.host_hdr == "example.com");
 }
 
 // #3: a caller-supplied Host suppresses the auto Host (exactly one Host line).

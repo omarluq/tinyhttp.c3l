@@ -295,38 +295,48 @@ fn Response? do_exchange(Allocator allocator, Conn conn, Method method, String h
 
 // ---- convenience wrappers (open a connection, send, close) ------------------
 
-<* Parse `url_str` (must be http:// or https://) into the connect `Url`, the RFC 7230 §5.4
-   Host header value (host, plus non-default port), and the request-target
-   (percent-re-encoded path + raw query). *>
-fn void? make_request_target(String url_str, Url* u, String* host_hdr, String* target) @private
+<* The resolved pieces of a request URL: the connect `Url`, the RFC 7230 §5.4
+   Host header value, the request-target, the resolved connect port and whether
+   the scheme is https. *>
+struct RequestTarget @private
 {
-    *u = url::parse(tmem, url_str) ?? INVALID_URL~!;   // maps url faults (incl. EMPTY on "") to INVALID_URL
+    Url    url;
+    String host_hdr;
+    String target;
+    int    port;
+    bool   is_https;
+}
+
+<* Parse `url_str` (must be http:// or https://) into a `RequestTarget`: the connect
+   `Url`, the RFC 7230 §5.4 Host header value (host, plus non-default port), the
+   request-target (percent-re-encoded path + raw query), the resolved connect port
+   (explicit port, else the scheme default) and the is_https flag. *>
+fn RequestTarget? make_request_target(String url_str) @private
+{
+    Url u = url::parse(tmem, url_str) ?? INVALID_URL~!;   // maps url faults (incl. EMPTY on "") to INVALID_URL
     bool is_https = ci_eq(u.scheme, "https");
     if (!is_https && !ci_eq(u.scheme, "http")) return UNSUPPORTED_SCHEME~;
     int default_port = is_https ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT;
     int port = u.port ?: default_port;
-    *host_hdr = port == default_port ? u.host : string::tformat("%s:%d", u.host, port);
+    String host_hdr = port == default_port ? u.host : string::tformat("%s:%d", u.host, port);
     String path = u.path.len != 0 ? url::tencode(u.path, url::UrlEncodingMode.PATH) : "/";  // re-encode path
     if (u.query.len != 0) path = string::tformat("%s?%s", path, u.query);                   // query left un-decoded by url::parse
-    *target = path;
+    return { .url = u, .host_hdr = host_hdr, .target = path, .port = port, .is_https = is_https };
 }
 
 <* Perform `method url_str` over a fresh connection. `url_str` must be http:// or https://. *>
 fn Response? request_url(Method method, String url_str, Header[] headers = {}, char[] body = {}, Duration timeout = time::DURATION_ZERO, Allocator allocator = tmem, TlsConfig tls = {})
 {
-    Url u; String host_hdr; String target;
-    make_request_target(url_str, &u, &host_hdr, &target)!;
-    if (ci_eq(u.scheme, "https"))
+    RequestTarget rt = make_request_target(url_str)!;
+    if (rt.is_https)
     {
-        int tls_port = u.port ?: DEFAULT_HTTPS_PORT;
-        TlsConn conn = dial_tls(u.host, tls_port, tls, timeout)!;
+        TlsConn conn = dial_tls(rt.url.host, rt.port, tls, timeout)!;
         defer (void)conn.close();
-        return send(allocator, &conn, method, host_hdr, target, headers, body);
+        return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
     }
-    int port = u.port ?: DEFAULT_HTTP_PORT;
-    PlainConn conn = dial(u.host, port, timeout)!;
+    PlainConn conn = dial(rt.url.host, rt.port, timeout)!;
     defer (void)conn.close();
-    return send(allocator, &conn, method, host_hdr, target, headers, body);
+    return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
 }
 
 <* Perform `GET url` over a fresh connection. `url` must be http:// or https://. *>

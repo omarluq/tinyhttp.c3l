@@ -72,18 +72,15 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     Header[MAX_HEADERS] merged;
     usz m = merge_headers(merged[..], self.default_headers, headers)!;
 
-    Url u; String host_hdr; String target;
-    make_request_target(url, &u, &host_hdr, &target)!;
-    bool is_https = ci_eq(u.scheme, "https");
-    int port = u.port ?: (is_https ? DEFAULT_HTTPS_PORT : DEFAULT_HTTP_PORT);
-    String scheme = is_https ? "https" : "http";
-    String key = pool_key(scheme, u.host, port);
+    RequestTarget rt = make_request_target(url)!;
+    String scheme = rt.is_https ? "https" : "http";
+    String key = pool_key(scheme, rt.url.host, rt.port);
 
     // Pooled attempt: reuse an idle connection if one is available.
     if (try ic = self.pool.checkout(key))
     {
         bool reusable;
-        Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, merged[:m], body, true, &reusable);
+        Response? r = do_exchange(self.allocator, ic.conn, method, rt.host_hdr, rt.target, merged[:m], body, true, &reusable);
         if (catch e = r)
         {
             self.pool.discard(ic);
@@ -98,9 +95,9 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     }
 
     // Fresh connection (also the stale-retry path; reused:false, so STALE_CONNECTION cannot arise here).
-    IdleConn ic = self.dial_idle(is_https, u.host, port)!;
+    IdleConn ic = self.dial_idle(rt.is_https, rt.url.host, rt.port)!;
     bool reusable;
-    Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, merged[:m], body, false, &reusable);
+    Response? r = do_exchange(self.allocator, ic.conn, method, rt.host_hdr, rt.target, merged[:m], body, false, &reusable);
     if (catch e = r)
     {
         self.pool.discard(ic);
