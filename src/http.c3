@@ -240,7 +240,12 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     if (!bodiless)
     {
         is_chunked = te_is_chunked(presp.headers);
-        if (!is_chunked)
+        // RFC 7230 §3.3.3 rule 3: when Transfer-Encoding is present but chunked is not
+        // the final coding, the body is delimited by connection close and Content-Length
+        // MUST be ignored. Only trust Content-Length when Transfer-Encoding is absent;
+        // otherwise leave content_length = -1 so phase 2 dispatches to read_body_to_eof
+        // and `delimited` stays false (non-reusable), closing a smuggling-adjacent hazard.
+        if (!is_chunked && !has_header(presp.headers, "Transfer-Encoding"))
         {
             long clv = content_length_header(presp.headers)!;   // -1 when absent; faults on conflicting duplicate fields
             if (clv >= 0)

@@ -732,6 +732,25 @@ fn void test_read_response_not_reusable_read_to_eof() @test
     assert(!reusable);                                       // boundary is the close itself
 }
 
+// R2/#3: RFC 7230 §3.3.3 rule 3 — a response with Transfer-Encoding present but
+// NOT chunked as the final coding must ignore Content-Length, frame the body by
+// connection close (read to EOF), and never be reusable. Trusting the length here
+// would be a smuggling-adjacent hazard.
+fn void test_read_response_te_non_chunked_ignores_content_length() @test
+{
+    // Content-Length: 3 would wrongly frame just "gzi" if trusted; the whole body
+    // must be read to EOF instead.
+    MockConn m = mock("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 3\r\n\r\ngzipped body");
+    defer m.written.free();
+
+    bool reusable;
+    Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+    defer resp.free();
+
+    assert(resp.body == "gzipped body");                     // Content-Length ignored, read to EOF
+    assert(!reusable);                                       // boundary is the close itself
+}
+
 // K10: pipelined trailing bytes (a second response already in the buffer) are
 // dropped, and their presence makes the connection non-reusable (leftover > 0).
 fn void test_read_response_leftover_not_reusable() @test
