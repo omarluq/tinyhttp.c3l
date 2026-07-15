@@ -116,19 +116,12 @@ fn usz? decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
             nextcase;
         case IN_CHUNK_DATA:
             {
-                usz avail = size - src;
-                if (avail < decoder.bytes_left_in_chunk)
-                {
-                    if (dst != src) mem::move(b + dst, b + src, (sz)avail);
-                    src += avail;
-                    dst += avail;
-                    decoder.bytes_left_in_chunk -= avail;
-                    break OUTER;
-                }
-                if (dst != src) mem::move(b + dst, b + src, (sz)decoder.bytes_left_in_chunk);
-                src += decoder.bytes_left_in_chunk;
-                dst += decoder.bytes_left_in_chunk;
-                decoder.bytes_left_in_chunk = 0;
+                usz n = min(size - src, decoder.bytes_left_in_chunk);
+                if (dst != src) mem::move(b + dst, b + src, (sz)n);
+                src += n;
+                dst += n;
+                decoder.bytes_left_in_chunk -= n;
+                if (decoder.bytes_left_in_chunk != 0) break OUTER;
                 decoder._state = IN_CHUNK_DATA_EXPECT_CR;
             }
             nextcase;
