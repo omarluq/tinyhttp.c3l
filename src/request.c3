@@ -85,19 +85,20 @@ fn void? write_request(Conn conn, Method method, String host, String path, Heade
    overflowed and `send` faults with TOO_MANY_HEADERS. *>
 struct RequestBuilder
 {
-    Method   method;
-    String   url;
-    char[]   _body;
-    Duration _timeout;
+    Method    method;
+    String    url;
+    char[]    _body;
+    Duration  _timeout;
+    TlsConfig _tls;
     Header[MAX_HEADERS] _headers;
-    usz      _count;
-    bool     _overflow;
+    usz       _count;
+    bool      _overflow;
 }
 
-<* Begin a `method` request to `url` (must be http://). Returns an UNSENT
-   RequestBuilder: chain `.header()` / `.body()` / `.timeout()`, then call
-   `.send()` to execute — unlike `Client.request` / `request_url`, no I/O
-   happens here. *>
+<* Begin a `method` request to `url` (must be http:// or https://). Returns an
+   UNSENT RequestBuilder: chain `.header()` / `.body()` / `.timeout()` / `.tls()`,
+   then call `.send()` to execute — unlike `Client.request` / `request_url`, no
+   I/O happens here. *>
 fn RequestBuilder request(Method method, String url) => { .method = method, .url = url };
 
 <* Append a header. Returns the builder for chaining. Beyond MAX_HEADERS the
@@ -130,10 +131,18 @@ fn RequestBuilder* RequestBuilder.timeout(&self, Duration timeout)
     return self;
 }
 
+<* Set the TLS configuration used for an https:// URL (ignored for http://).
+   Returns the builder for chaining. *>
+fn RequestBuilder* RequestBuilder.tls(&self, TlsConfig tls)
+{
+    self._tls = tls;
+    return self;
+}
+
 <* Open a connection, send the request, and read the response. Faults with
    TOO_MANY_HEADERS if more than MAX_HEADERS headers were supplied. *>
 fn Response? RequestBuilder.send(&self, Allocator allocator = tmem)
 {
     if (self._overflow) return TOO_MANY_HEADERS~;
-    return request_url(self.method, self.url, self._headers[:self._count], self._body, self._timeout, allocator);
+    return request_url(self.method, self.url, self._headers[:self._count], self._body, self._timeout, allocator, tls: self._tls);
 }

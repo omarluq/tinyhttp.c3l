@@ -225,7 +225,8 @@ fn void test_user_agent_override() @test
 fn void test_builder() @test
 {
     RequestBuilder b = request(POST, "http://x/y");
-    b.header("A", "1").header("B", "2").body("data").timeout(3 * time::SEC);
+    b.header("A", "1").header("B", "2").body("data").timeout(3 * time::SEC)
+        .tls({ .no_verify = true, .ca_file = "/etc/ca.pem" });
     assert(b.method == POST);
     assert(b.url == "http://x/y");
     assert(b._count == 2);
@@ -233,6 +234,12 @@ fn void test_builder() @test
     assert(b._headers[1].value == "2");
     assert(b._body == "data");
     assert(b._timeout == 3 * time::SEC);
+    assert(b._tls.no_verify);
+    assert(b._tls.ca_file == "/etc/ca.pem");
+
+    // Default builder keeps verification on (TlsConfig{}).
+    RequestBuilder d = request(GET, "https://x/y");
+    assert(!d._tls.no_verify);
 }
 
 // ---- regression tests ------------------------------------------------------
