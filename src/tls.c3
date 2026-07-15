@@ -72,7 +72,10 @@ fn sz? TlsConn.read(&self, char[] buf) @dynamic
     // 0 / negative: distinguish EOF (clean close, or the peer just closed TCP)
     // from a genuine protocol error.
     CInt err = ssl_get_error(self.ssl, n);
-    if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL) return 0;   // EOF
+    if (err == SSL_ERROR_ZERO_RETURN) return 0;                    // clean close_notify
+    // SSL_ERROR_SYSCALL with n == 0 is a peer TCP close without close_notify
+    // (benign EOF); n < 0 is a genuine syscall failure and must surface.
+    if (err == SSL_ERROR_SYSCALL) return n == 0 ? 0 : TLS_FAILED~;
     return TLS_FAILED~;
 }
 
