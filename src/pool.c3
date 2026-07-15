@@ -45,18 +45,13 @@ fn IdleConn? ConnPool.checkout(&self, String key) @private
 fn void ConnPool.checkin(&self, String key, IdleConn ic) @private
 {
     self.ensure_init();
-    if (try list = self.map.get_ref(key))
-    {
-        list.push(ic);
-        return;
-    }
-    IdleList list;
-    list.init(self.allocator, 2);
+    // get_or_create_ref copies the transient `key` into self.allocator on a
+    // miss (freed on map.free()), so the key need not outlive this call and
+    // must not be pre-copied (that would leak). A freshly created bucket is
+    // zeroed (is_initialized() false), so init it before the first push.
+    IdleList* list = self.map.get_or_create_ref(key);
+    if (!list.is_initialized()) list.init(self.allocator, 2);
     list.push(ic);
-    // String keys implement copy, so the HashMap duplicates the key into
-    // self.allocator on set and frees it on map.free(); the transient `key`
-    // need not outlive this call and must not be pre-copied (that would leak).
-    self.map.set(key, list);
 }
 
 fn void ConnPool.discard(&self, IdleConn ic) @private
