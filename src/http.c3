@@ -27,8 +27,6 @@ faultdef
     MALFORMED_RESPONSE,   // response could not be parsed
     INVALID_URL,          // url could not be parsed into a usable http:// target
     INCOMPLETE_RESPONSE,  // Content-Length exceeded the bytes received before EOF
-    TLS_FAILED,           // TLS setup, read, or write failed
-    TLS_HANDSHAKE_FAILED, // TLS handshake or certificate verification failed
     STALE_CONNECTION;     // internal retry signal: a reused keep-alive conn was closed before the response arrived; consumed by the retry-once path and never returned to the user
 
 const usz MAX_RESPONSE_HEADERS @private = 100;

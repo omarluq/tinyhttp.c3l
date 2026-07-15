@@ -10,6 +10,10 @@ import std::net;
 import std::net::tcp;
 import std::time;
 
+faultdef
+    TLS_FAILED,            // TLS setup, read, or write failed
+    TLS_HANDSHAKE_FAILED;  // TLS handshake or certificate verification failed
+
 // ---- OpenSSL bindings (the library heap-allocates every handle) ------------
 
 typedef SslMethod       @private = inline void*;   // const SSL_METHOD*
