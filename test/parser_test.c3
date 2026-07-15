@@ -252,6 +252,19 @@ fn void test_chunked_consume_trailer() @test
     assert(bufsz == 0);
 }
 
+fn void test_chunked_bare_lf_size_line() @test
+{
+    // A lenient origin may terminate the chunk-size/ext line with a bare LF.
+    // This must be accepted, matching at_eol/upstream picohttpparser.
+    char[64] store;
+    char[] buf = fill(&store, "3\nabc\r\n0\n\r\n");
+    usz bufsz = buf.len;
+    ChunkedDecoder dec;
+    @assert_ok(decode_chunked(&dec, buf, &bufsz), 2);   // trailing CRLF left over
+    assert(bufsz == 3);
+    assert(seq(store[:3], "abc"));
+}
+
 fn void test_chunked_invalid() @test
 {
     char[64] store;

@@ -7,7 +7,6 @@ enum ChunkedState : char @private
 {
     IN_CHUNK_SIZE,
     IN_CHUNK_EXT,
-    IN_CHUNK_HEADER_EXPECT_LF,
     IN_CHUNK_DATA,
     IN_CHUNK_DATA_EXPECT_CR,
     IN_CHUNK_DATA_EXPECT_LF,
@@ -92,20 +91,16 @@ fn usz? decode_chunked(ChunkedDecoder* decoder, char[] buf, usz* bufsz)
             decoder._state = IN_CHUNK_EXT;
             nextcase;
         case IN_CHUNK_EXT:
-            // RFC 7230 A.2: line folding in chunk extensions is disallowed.
+            // Scan the chunk-size/extension line to LF, treating CR as ext
+            // content. This accepts bare-LF endings, matching parser.c3's
+            // at_eol/check_complete and upstream picohttpparser (which scan
+            // chunk lines to LF).
             while (true)
             {
                 if (src == size) break OUTER;
-                if (b[src] == '\r') break;
-                if (b[src] == '\n') return MALFORMED~;
+                if (b[src] == '\n') break;
                 src++;
             }
-            src++;
-            decoder._state = IN_CHUNK_HEADER_EXPECT_LF;
-            nextcase;
-        case IN_CHUNK_HEADER_EXPECT_LF:
-            if (src == size) break OUTER;
-            if (b[src] != '\n') return MALFORMED~;
             src++;
             if (decoder.bytes_left_in_chunk == 0)
             {
