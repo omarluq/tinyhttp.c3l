@@ -307,13 +307,9 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
    permitted reuse AND the request itself did not send Connection: close. *>
 fn Response? do_exchange(Allocator allocator, Conn conn, Method method, String host, String path, Header[] headers, char[] body, bool reused, bool* reusable) @private
 {
-    if (reused)
+    if (catch e = write_request(conn, method, host, path, headers, body, close: false))
     {
-        if (catch write_request(conn, method, host, path, headers, body, close: false)) return STALE_CONNECTION~;
-    }
-    else
-    {
-        write_request(conn, method, host, path, headers, body, close: false)!;
+        return reused ? STALE_CONNECTION~ : e~;
     }
     bool resp_reusable = false;
     Response resp = read_response(allocator, conn, method, reused, &resp_reusable)!;   // STALE_CONNECTION propagates when reused && the first read failed
