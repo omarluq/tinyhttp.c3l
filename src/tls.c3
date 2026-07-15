@@ -73,6 +73,7 @@ struct TlsConn (Conn)
 
 fn sz? TlsConn.read(&self, char[] buf) @dynamic
 {
+    if (buf.len == 0) return 0;   // honor the same 0-byte contract as PlainConn/recv
     CInt n = ssl_read(self.ssl, (void*)buf.ptr, (CInt)buf.len);
     if (n > 0) return (sz)n;
     // 0 / negative: distinguish EOF (clean close, or the peer just closed TCP)
@@ -87,6 +88,7 @@ fn sz? TlsConn.read(&self, char[] buf) @dynamic
 
 fn sz? TlsConn.write(&self, char[] buf) @dynamic
 {
+    if (buf.len == 0) return 0;   // SSL_write(num==0) returns <=0; match PlainConn's 0-byte contract
     CInt n = ssl_write(self.ssl, (void*)buf.ptr, (CInt)buf.len);
     if (n > 0) return (sz)n;
     return TLS_FAILED~;

@@ -27,6 +27,17 @@ fn void test_ip_literal() @test
     assert(!@ok(ip_literal("localhost")));
 }
 
+// A zero-length read/write must return 0 without invoking OpenSSL, matching
+// PlainConn's contract (SSL_write(num==0) would otherwise fault as TLS_FAILED).
+// The 0-len guard returns before touching self.ssl, so a null-ssl conn is safe.
+fn void test_zero_length_io() @test
+{
+    TlsConn tc = {};   // ssl == null; guards short-circuit before any OpenSSL call
+    char[] empty = {};
+    assert(tc.write(empty)!! == 0);
+    assert(tc.read(empty)!! == 0);
+}
+
 // Live end-to-end HTTPS round-trip: real handshake + certificate verification vs
 // the system trust store, then a decrypted 200 response. Gated on TINYHTTP_LIVE
 // (needs a network), so the default `compile-test` stays offline.
