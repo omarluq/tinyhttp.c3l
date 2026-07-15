@@ -131,29 +131,19 @@ fn String pool_key(String scheme, String host, int port) @private
 
 <* Dial a fresh connection into a heap object owned by the Client allocator,
    returning it wrapped as an IdleConn (`.conn` = the Conn fat pointer, `.mem` =
-   the heap allocation to free). Frees the object if the dial fails. *>
+   the heap allocation to free). *>
 fn IdleConn? Client.dial_idle(&self, bool is_https, String host, int port) @private
 {
     if (is_https)
     {
         TlsConn* c = alloc::new(self.allocator, TlsConn);
-        TlsConn? conn = dial_tls(host, port, self.tls, self.timeout);
-        if (catch e = conn)
-        {
-            alloc::free(self.allocator, c);
-            return e~;
-        }
-        *c = conn;
+        defer catch alloc::free(self.allocator, c);
+        *c = dial_tls(host, port, self.tls, self.timeout)!;
         return { .conn = (Conn)c, .mem = c };
     }
     PlainConn* c = alloc::new(self.allocator, PlainConn);
-    PlainConn? conn = dial(host, port, self.timeout);
-    if (catch e = conn)
-    {
-        alloc::free(self.allocator, c);
-        return e~;
-    }
-    *c = conn;
+    defer catch alloc::free(self.allocator, c);
+    *c = dial(host, port, self.timeout)!;
     return { .conn = (Conn)c, .mem = c };
 }
 
