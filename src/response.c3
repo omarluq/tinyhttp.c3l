@@ -18,7 +18,9 @@ struct Response
 <* True for a 2xx status. *>
 fn bool Response.ok(&self) => self.status >= 200 && self.status < 300;
 
-<* Case-insensitive lookup of a header value, or an empty string if absent. *>
+<* Case-insensitive lookup of a header value, or an empty string if absent.
+   The returned string is a view into the response buffer and is invalid after
+   `free()`; an empty result may also mean present-but-empty (see `has_header`). *>
 fn String Response.header(&self, String name) => find_header(self.headers, name);
 
 <* True if a header named `name` is present (case-insensitive), even when its
