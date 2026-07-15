@@ -339,7 +339,9 @@ fn Response? do_exchange(Allocator allocator, Conn conn, Method method, String h
 {
     if (catch e = write_request(conn, method, host, path, headers, body, close: false))
     {
-        return reused ? STALE_CONNECTION~ : e~;
+        // Only auto-retry idempotent methods: a partial write of a POST/PATCH may have
+        // reached a server that already started processing, so resending could double it.
+        return reused && method.is_idempotent() ? STALE_CONNECTION~ : e~;
     }
     bool resp_reusable = false;
     Response resp = read_response(allocator, conn, method, reused, &resp_reusable)!;   // STALE_CONNECTION propagates when reused && the first read failed

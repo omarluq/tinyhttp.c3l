@@ -19,6 +19,11 @@ enum Method : char (String name)
     OPTIONS { "OPTIONS" },
 }
 
+<* True for methods safe to auto-retry after a mid-flight write failure. POST and
+   PATCH are excluded: a partial write may have reached a server that already began
+   processing, so a transparent resend could execute them twice. *>
+fn bool Method.is_idempotent(self) => self != POST && self != PATCH;
+
 fn bool has_crlf(String s) @private => s.contains_char('\r') || s.contains_char('\n');
 
 <* Serialize an HTTP/1.1 request and write it to `conn`. Host, a default

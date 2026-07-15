@@ -12,7 +12,10 @@ struct MockConn (Conn)
     DString written;
     bool   synth;        // synthetic large-body mode (no real source buffer)
     usz    synth_left;   // remaining synthetic bytes to serve
+    bool   fail_write;   // when set, every write faults MOCK_WRITE_FAILED (mid-flight write failure)
 }
+
+faultdef MOCK_WRITE_FAILED;   // stand-in for a socket write error surfaced by io::write_all
 
 fn sz? MockConn.read(&self, char[] buf) @dynamic
 {
@@ -34,6 +37,7 @@ fn sz? MockConn.read(&self, char[] buf) @dynamic
 
 fn sz? MockConn.write(&self, char[] buf) @dynamic
 {
+    if (self.fail_write) return MOCK_WRITE_FAILED~;
     self.written.append_bytes(buf);
     return (sz)buf.len;
 }
@@ -871,4 +875,28 @@ fn void test_stale_then_fresh_retry() @test
     assert(ru2);
     assert(fresh.written.str_view().contains("GET / HTTP/1.1\r\n"));
     assert(!fresh.written.str_view().contains("Connection: close"));   // persistent path
+}
+
+// Issue #4: a write failure on a reused pooled conn maps to STALE_CONNECTION only for
+// idempotent methods. A GET may be transparently resent; a POST must surface the raw
+// write fault so the caller never re-submits a request the server may have begun.
+fn void test_write_fail_stale_only_when_idempotent() @test
+{
+    MockConn get_conn = mock("");
+    get_conn.fail_write = true;
+    defer get_conn.written.free();
+
+    bool ru_get;
+    Response? get_res = do_exchange(mem, &get_conn, GET, "x", "/", {}, {}, true, &ru_get);
+    if (try resp = get_res) { resp.free(); assert(false, "expected fault from failed write"); }
+    if (catch e = get_res) assert(e == STALE_CONNECTION, "idempotent GET write failure retries as STALE");
+
+    MockConn post_conn = mock("");
+    post_conn.fail_write = true;
+    defer post_conn.written.free();
+
+    bool ru_post;
+    Response? post_res = do_exchange(mem, &post_conn, POST, "x", "/", {}, "data", true, &ru_post);
+    if (try resp = post_res) { resp.free(); assert(false, "expected fault from failed write"); }
+    if (catch e = post_res) assert(e == MOCK_WRITE_FAILED, "non-idempotent POST surfaces raw write fault, no retry");
 }
