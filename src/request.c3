@@ -109,7 +109,7 @@ fn RequestBuilder* RequestBuilder.timeout(&self, Duration timeout)
 
 <* Open a connection, send the request, and read the response. Faults with
    TOO_MANY_HEADERS if more than MAX_HEADERS headers were supplied. *>
-fn Response? RequestBuilder.send(self, Allocator allocator = tmem)
+fn Response? RequestBuilder.send(&self, Allocator allocator = tmem)
 {
     if (self._overflow) return TOO_MANY_HEADERS~;
     return request_url(self.method, self.url, self._headers[:self._count], self._body, self._timeout, allocator);
