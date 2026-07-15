@@ -111,6 +111,61 @@ fn void test_send_read_to_eof() @test
     assert(resp.body == "plain body bytes");
 }
 
+fn void test_send_100_continue() @test
+{
+    // A 1xx interim response must be discarded; the real >=200 response is returned.
+    MockConn m = mock("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Real: yes\r\n\r\nhello");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 200);
+    assert(resp.body == "hello");
+    assert(resp.header("X-Real") == "yes");
+}
+
+fn void test_send_103_early_hints() @test
+{
+    // 103 Early Hints (carries headers, no body) is interim: skip it, keep the final response.
+    MockConn m = mock("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 200);
+    assert(resp.body == "ok");
+    assert(resp.header("Link").len == 0);            // interim headers are not surfaced
+}
+
+fn void test_send_multiple_interim() @test
+{
+    // Several stacked 1xx blocks ahead of the real response are all discarded.
+    MockConn m = mock("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\ndone");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, POST, "x", "/", body: "{}")!!;
+    defer resp.free();
+
+    assert(resp.status == 201);
+    assert(resp.body == "done");
+}
+
+fn void test_send_101_not_skipped() @test
+{
+    // 101 Switching Protocols is a real (bodiless) response, NOT an interim to discard.
+    MockConn m = mock("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+    defer m.written.free();
+
+    Response resp = send(mem, &m, GET, "x", "/")!!;
+    defer resp.free();
+
+    assert(resp.status == 101);
+    assert(resp.body.len == 0);
+    assert(resp.header("Upgrade") == "websocket");
+}
+
 fn void test_send_post_body() @test
 {
     MockConn m = mock("HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");

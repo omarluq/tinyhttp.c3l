@@ -165,31 +165,66 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     usz consumed = 0;   // header-block length, once parsed
 
     // PHASE 1: read the status line + header block, re-parsing after each read.
+    // An HTTP/1.1 server may emit one or more 1xx interim responses (100 Continue,
+    // 103 Early Hints — now routinely injected by CDNs) ahead of the real response.
+    // A 1xx carries no body (RFC 7230 §3.3.3), so discard each interim block, compact
+    // any already-buffered tail (which may hold the start of the next response) down to
+    // offset 0 and keep reading; phase 4 re-parses from offset 0, so the compaction must
+    // be physical, not a base-offset. 101 Switching Protocols is a real response, not
+    // interim. Bound the interim count so a peer can't stream 1xx forever (DoS).
+    const usz MAX_INTERIM_RESPONSES = 8;
+    usz interim = 0;
     while (true)
     {
-        w.ensure_capacity(w.index + 4096)!;
-        sz? nr = read_into(conn, &w, &received);
-        if (catch e = nr)
+        // Accumulate one complete header block, parsing already-buffered bytes first and
+        // reading more only while the block is incomplete (after compaction the next
+        // response may already be fully buffered, so a blind read must not precede a parse).
+        while (true)
         {
-            if (reused && w.index == 0) return STALE_CONNECTION~;   // idle keep-alive conn was closed
-            return e~;
-        }
-        sz n = nr;
-        if (n == 0)
-        {
-            if (reused && w.index == 0) return STALE_CONNECTION~;
-            return MALFORMED_RESPONSE~;                             // EOF before a complete header block
+            if ((usz)w.index > last)
+            {
+                usz? c = httpparser::parse_response(w.array_view(), &presp, hstore[..], last);
+                if (try cv = c)
+                {
+                    consumed = cv;   // parsed: cv is the header-block length
+                    break;
+                }
+                if (catch pe = c)
+                {
+                    if (pe == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
+                    last = (usz)w.index;   // INCOMPLETE: valid prefix, read more
+                }
+            }
+            w.ensure_capacity(w.index + 4096)!;
+            sz? nr = read_into(conn, &w, &received);
+            if (catch e = nr)
+            {
+                if (reused && interim == 0 && w.index == 0) return STALE_CONNECTION~;   // idle keep-alive conn was closed
+                return e~;
+            }
+            sz n = nr;
+            if (n == 0)
+            {
+                if (reused && interim == 0 && w.index == 0) return STALE_CONNECTION~;
+                return MALFORMED_RESPONSE~;                             // EOF before a complete header block
+            }
         }
 
-        usz? c = httpparser::parse_response(w.array_view(), &presp, hstore[..], last);
-        if (catch pe = c)
+        // Discard a 1xx interim response (except 101) and re-parse the compacted tail.
+        if (presp.status >= 100 && presp.status < 200 && presp.status != 101)
         {
-            if (pe == httpparser::MALFORMED) return MALFORMED_RESPONSE~;
-            last = (usz)w.index;   // INCOMPLETE: valid prefix, read more
+            if (++interim > MAX_INTERIM_RESPONSES) return MALFORMED_RESPONSE~;   // interim flood
+            usz tail = (usz)w.index - consumed;   // bytes past the interim block: start of the next response
+            if (tail != 0)
+            {
+                char[] view = w.array_view();
+                mem::move(view.ptr, view.ptr + consumed, (sz)tail);   // physically shift the tail to offset 0
+            }
+            w.index = (sz)tail;
+            last = 0;   // buffer shifted; the slowloris resume hint no longer applies
             continue;
         }
-        consumed = c;   // parsed: c is the header-block length
-        break;
+        break;   // final response: status >= 200, or 101 Switching Protocols
     }
 
     // Framing SCALARS from the phase-1 parse. Header token slices are invalidated by
