@@ -31,7 +31,6 @@ fn bool has_header(Header[] headers, String name) @private => find_header_ref(he
 // Case-insensitive scan of a comma-separated header value for an exact token.
 fn bool conn_has_token(String value, String token) @private
 {
-    if (value.len == 0) return false;
     Splitter it = value.tokenize(",");
     while (try part = it.next())
     {
