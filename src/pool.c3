@@ -80,5 +80,9 @@ fn void ConnPool.free(&self) @private
     // map.free() releases each entry's owned key copy (String keys implement
     // copy) along with the table, so keys must not be freed here.
     self.map.free();
+    // Zero the map so is_initialized() reports false again; HashMap.free leaves
+    // map.allocator set, so a later ensure_init->map.init would trip its
+    // @require !is_initialized() contract without this reset.
+    self.map = {};
     self.inited = false;
 }
