@@ -204,17 +204,7 @@ fn Response? read_response(Allocator allocator, Conn conn, Method method, bool r
     long content_length = -1;
     if (!bodiless)
     {
-        // R5 + R14: chunked iff the FINAL transfer-coding across ALL Transfer-Encoding
-        // header lines is chunked (multiple TE headers == one comma list; last one wins).
-        String te = "";
-        bool have_te = false;
-        foreach (&h : presp.headers) if (ci_eq(h.name, "Transfer-Encoding")) { te = (String)h.value; have_te = true; }
-        if (have_te)
-        {
-            String last_te = te;
-            if (try i = te.rindex_of(",")) last_te = te[i + 1..];
-            is_chunked = ci_eq((char[])last_te.trim(), "chunked");
-        }
+        is_chunked = te_is_chunked(presp.headers);
         if (!is_chunked)
         {
             String cl = find_header(presp.headers, "Content-Length");
