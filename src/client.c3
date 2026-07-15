@@ -79,25 +79,32 @@ fn Response? Client.request(&self, Method method, String path, Header[] headers 
     // Pooled attempt: reuse an idle connection if one is available.
     if (try ic = self.pool.checkout(key))
     {
-        bool reusable;
-        Response? r = do_exchange(self.allocator, ic.conn, method, rt.host_hdr, rt.target, merged[:m], body, true, &reusable);
+        Response? r = self.exchange_and_settle(key, ic, method, rt.host_hdr, rt.target, merged[:m], body, true);
+        // On a real fault the socket is already discarded; only a stale idle
+        // socket falls through to a fresh dial.
         if (catch e = r)
         {
-            self.pool.discard(ic);
-            if (e != STALE_CONNECTION) return e~;   // real fault; a stale idle socket falls through to a fresh dial
+            if (e != STALE_CONNECTION) return e~;
         }
         else
         {
-            if (reusable) { self.pool.checkin(key, ic); }
-            else { self.pool.discard(ic); }
             return r;
         }
     }
 
     // Fresh connection (also the stale-retry path; reused:false, so STALE_CONNECTION cannot arise here).
     IdleConn ic = self.dial_idle(rt.is_https, rt.url.host, rt.port)!;
+    return self.exchange_and_settle(key, ic, method, rt.host_hdr, rt.target, merged[:m], body, false);
+}
+
+<* Run one request/response exchange on `ic` and settle its pool membership:
+   on fault the connection is discarded and the fault re-raised; otherwise the
+   connection is returned to the pool under `key` when still reusable, or
+   discarded when not. `reused` marks whether `ic` came from the pool. *>
+fn Response? Client.exchange_and_settle(&self, String key, IdleConn ic, Method method, String host_hdr, String target, Header[] headers, char[] body, bool reused) @private
+{
     bool reusable;
-    Response? r = do_exchange(self.allocator, ic.conn, method, rt.host_hdr, rt.target, merged[:m], body, false, &reusable);
+    Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, headers, body, reused, &reusable);
     if (catch e = r)
     {
         self.pool.discard(ic);
