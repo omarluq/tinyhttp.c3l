@@ -109,12 +109,7 @@ fn void? Reader.skip_ws(&self)
 // Consume a required line ending (CRLF or bare LF).
 fn void? Reader.eol(&self)
 {
-    switch (self.next()!)
-    {
-        case '\r': return self.expect('\n');
-        case '\n': return;
-        default:   return MALFORMED~;
-    }
+    if (!self.at_eol()!) return MALFORMED~;
 }
 
 // If positioned at a line ending, consume it and return true; else false.
@@ -163,12 +158,7 @@ fn char[]? Reader.line(&self)
         self.pos++;
     }
     usz end = self.pos;
-    switch (self.buf[self.pos])
-    {
-        case '\r': self.pos++; self.expect('\n')!;
-        case '\n': self.pos++;
-        default:   return MALFORMED~;
-    }
+    self.eol()!;
     return self.buf[start:end - start];
 }
 
