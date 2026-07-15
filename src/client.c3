@@ -48,9 +48,7 @@ fn usz? merge_headers(Header[] dst, Header[] defaults, Header[] overrides) @priv
     usz m = 0;
     foreach (&h : defaults)
     {
-        bool overridden = false;
-        foreach (&c : overrides) if (ci_eq(h.name, (String)c.name)) { overridden = true; break; }
-        if (overridden) continue;
+        if (has_header(overrides, (String)h.name)) continue;
         if (m >= dst.len) return TOO_MANY_HEADERS~;
         dst[m++] = *h;
     }
