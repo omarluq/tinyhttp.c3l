@@ -175,8 +175,8 @@ fn int? Reader.http_version(&self)
 {
     // We want at least "HTTP/1.x" plus a lookahead byte before trying.
     if (self.buf.len - self.pos < 9) return INCOMPLETE~;
-    self.expect('H')!; self.expect('T')!; self.expect('T')!; self.expect('P')!;
-    self.expect('/')!; self.expect('1')!; self.expect('.')!;
+    if (!mem::equals(self.buf[self.pos:7], (char[])"HTTP/1.")) return MALFORMED~;
+    self.pos += 7;
     return self.digit()!;
 }
 
