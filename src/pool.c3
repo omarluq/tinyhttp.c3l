@@ -65,11 +65,7 @@ fn void ConnPool.free(&self) @private
     if (!self.inited) return;
     foreach (list : self.map.values(tmem))
     {
-        foreach (ic : list)
-        {
-            (void)ic.conn.close();
-            alloc::free(self.allocator, ic.mem);
-        }
+        foreach (ic : list) self.discard(ic);
         list.free();
     }
     // map.free() releases each entry's owned key copy (String keys implement
