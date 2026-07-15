@@ -85,9 +85,7 @@ fn BodyFrame? read_body_content_length(Conn conn, ByteWriter* w, usz consumed, u
         // Content-Length up front on the first byte.
         usz want = (usz)w.index + 65536;
         w.ensure_capacity((sz)(want < target ? want : target))!;
-        sz? nr = read_into(conn, w, received);   // read into the spare capacity
-        if (catch e = nr) return e~;
-        sz n = nr;
+        sz n = read_into(conn, w, received)!;   // read into the spare capacity
         if (n == 0) return INCOMPLETE_RESPONSE~;   // fewer bytes than Content-Length before EOF
         have = (usz)w.index - consumed;
     }
@@ -117,9 +115,7 @@ fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* rec
             // again. w.index (== consumed+decoded here) must advance by the bytes read
             // so the next array_view() exposes them as the new segment.
             w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
-            sz? nr = read_into(conn, w, received);
-            if (catch e = nr) return e~;
-            sz n = nr;
+            sz n = read_into(conn, w, received)!;
             if (n == 0) return INCOMPLETE_RESPONSE~;   // EOF mid-chunk
             seg = (usz)n;
             continue;
@@ -135,9 +131,7 @@ fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* rece
     while (true)
     {
         w.ensure_capacity(w.index + 4096)!;
-        sz? nr = read_into(conn, w, received);
-        if (catch e = nr) return e~;
-        sz n = nr;
+        sz n = read_into(conn, w, received)!;
         if (n == 0) break;
     }
     return { .body_len = (usz)w.index - consumed, .leftover = 0 };
