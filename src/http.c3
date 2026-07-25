@@ -62,9 +62,7 @@ fn Response? send(
 }
 
 // The live time budget for one request: the per-operation timeouts plus, when
-// `total` is non-zero, an absolute deadline measured from `start`. `armed_r` and
-// `armed_w` memoize the values last pushed to the socket so a steady-state read
-// loop re-arms with no extra syscall.
+// `total` is non-zero, an absolute deadline measured from `start`.
 struct Deadline @private
 {
 	Clock start;
@@ -94,6 +92,28 @@ fn Duration? Deadline.next(&self, Duration per_op) @private
 	return per_op;
 }
 
+// Arm the socket for the next read/write with the clamped budget. `armed_r` and
+// `armed_w` memoize the values last pushed to the socket, so a steady-state loop
+// re-arms with no extra syscall; the memo is only ever written here, and only
+// after the setsockopt it records actually succeeded. These two are the sole
+// writers of armed_r/armed_w — every call site goes through them so the clamp
+// and the memo can never drift apart in one direction.
+fn void? Deadline.arm_read(&self, Conn conn) @private
+{
+	Duration eff = self.next(self.read)!;
+	if (eff == self.armed_r) return;
+	conn.set_read_timeout(eff)!;
+	self.armed_r = eff;
+}
+
+fn void? Deadline.arm_write(&self, Conn conn) @private
+{
+	Duration eff = self.next(self.write)!;
+	if (eff == self.armed_w) return;
+	conn.set_write_timeout(eff)!;
+	self.armed_w = eff;
+}
+
 // Whether the total budget is exhausted as of now. A socket armed from the
 // REMAINING TOTAL rather than from the per-op timeout still reports READ_TIMEOUT /
 // WRITE_TIMEOUT when it fires, but the constraint actually violated is `total`; the
@@ -117,12 +137,7 @@ const Duration MIN_BUDGET @private = (Duration)1_000;
 // Callers own their ensure_capacity call (site-specific) and their own n==0 reaction.
 fn sz? read_into(Conn conn, ByteWriter* w, usz* received, Deadline* dl) @private
 {
-	Duration eff = dl.next(dl.read)!;
-	if (eff != dl.armed_r)
-	{
-		conn.set_read_timeout(eff)!;
-		dl.armed_r = eff;
-	}
+	dl.arm_read(conn)!;
 	sz? nr = conn.read(w.bytes[w.index..]);
 	if (catch e = nr)
 	{

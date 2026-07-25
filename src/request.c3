@@ -36,12 +36,7 @@ fn void? write_all_deadline(Conn conn, char[] buf, Deadline* dl) @private
 	usz off = 0;
 	while (off < buf.len)
 	{
-		Duration eff = dl.next(dl.write)!;
-		if (eff != dl.armed_w)
-		{
-			conn.set_write_timeout(eff)!;
-			dl.armed_w = eff;
-		}
+		dl.arm_write(conn)!;
 		sz? nw = conn.write(buf[off..]);
 		if (catch e = nw)
 		{
