@@ -57,6 +57,7 @@ extern fn CInt ssl_read(Ssl ssl, void* buf, CInt num) @cname("SSL_read") @privat
 extern fn CInt ssl_write(Ssl ssl, void* buf, CInt num) @cname("SSL_write") @private;
 extern fn CInt ssl_shutdown(Ssl ssl) @cname("SSL_shutdown") @private;
 extern fn CInt ssl_get_error(Ssl ssl, CInt ret) @cname("SSL_get_error") @private;
+extern fn void err_clear_error() @cname("ERR_clear_error") @private;
 
 // ---- public config ---------------------------------------------------------
 
@@ -91,10 +92,13 @@ struct TlsConn (Conn)
 fn sz? TlsConn.read(&self, char[] buf) @dynamic
 {
 	if (buf.len == 0) return 0; // honor the same 0-byte contract as PlainConn/recv
+	err_clear_error(); // SSL_get_error reads the thread-local queue first, so it must hold only this call's error
 	CInt n = ssl_read(self.ssl, (void*)buf.ptr, (CInt)buf.len);
 	if (n > 0) return (sz)n;
 	// 0 / negative: distinguish EOF (clean close, or the peer just closed TCP)
-	// from a genuine protocol error.
+	// from a genuine protocol error. The queue was emptied above, so what
+	// SSL_get_error reports here belongs to this ssl_read and nothing else —
+	// which is what the READ_TIMEOUT and benign-EOF arms below depend on.
 	CInt err = ssl_get_error(self.ssl, n);
 	if (err == SSL_ERROR_ZERO_RETURN) return 0; // clean close_notify
 	// On a blocking socket WANT_READ/WANT_WRITE can only mean SO_RCVTIMEO fired
@@ -109,6 +113,7 @@ fn sz? TlsConn.read(&self, char[] buf) @dynamic
 fn sz? TlsConn.write(&self, char[] buf) @dynamic
 {
 	if (buf.len == 0) return 0; // SSL_write(num==0) returns <=0; match PlainConn's 0-byte contract
+	err_clear_error(); // as in read: SSL_get_error below must see only this call's error
 	CInt n = ssl_write(self.ssl, (void*)buf.ptr, (CInt)buf.len);
 	if (n > 0) return (sz)n;
 	CInt err = ssl_get_error(self.ssl, n);
@@ -248,6 +253,10 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Timeout
 	// TCP and never speaks TLS hangs ssl_connect forever, even with a connect timeout.
 	set_fd_timeout(sock, os::SO_RCVTIMEO, timeouts.connect)!;
 	set_fd_timeout(sock, os::SO_SNDTIMEO, timeouts.connect)!;
+	// Same rule as read/write, and placed here rather than earlier because every
+	// call above returns on its own failure — their queue entries are never fed to
+	// an ssl_get_error, and only this handshake's are.
+	err_clear_error();
 	if (ssl_connect(ssl) != 1)
 	{
 		CInt herr = ssl_get_error(ssl, 0);
