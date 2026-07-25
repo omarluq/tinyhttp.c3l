@@ -1412,3 +1412,21 @@ fn void test_plain_conn_maps_expired_timeout() @test
 	}
 	assert(false, "expected READ_TIMEOUT, read %d byte(s)", (int)n);
 }
+
+fn void test_duration_to_ms_ceil() @test
+{
+	// The millisecond conversion the Winsock arm of set_fd_timeout feeds to
+	// SO_RCVTIMEO/SO_SNDTIMEO. Winsock reads 0 as "block forever", so the only
+	// budget allowed to produce 0 is one the caller already meant as "no limit";
+	// anything positive must round UP, or a sub-millisecond timeout silently
+	// disarms the socket and a stalled peer hangs the request forever.
+	assert(duration_to_ms_ceil(time::DURATION_ZERO) == 0);
+	assert(duration_to_ms_ceil((Duration)-1) == 0);
+	assert(duration_to_ms_ceil((Duration)1) == 1, "1us must not floor to 0");
+	assert(duration_to_ms_ceil(999 * time::US) == 1, "999us must not floor to 0");
+	assert(duration_to_ms_ceil(time::MS) == 1);
+	assert(duration_to_ms_ceil(time::MS + 1) == 2);
+	assert(duration_to_ms_ceil(30 * time::SEC) == 30_000);
+	// No overflow on the way to the DWORD: rounding must not add to the input.
+	assert(duration_to_ms_ceil(time::FOREVER) == uint::max);
+}

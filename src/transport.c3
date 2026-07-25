@@ -3,6 +3,7 @@
 // or a test mock can implement the same interface with nothing above changing.
 
 module tinyhttp;
+import std::core::env;
 import std::io;
 import std::net;
 import std::net::tcp;
@@ -70,19 +71,44 @@ interface Conn : InStream, OutStream
 }
 
 // The stdlib has no Timeval type, and Socket.set_option only carries a 4-byte
-// bool, so SO_RCVTIMEO/SO_SNDTIMEO are set through os::setsockopt directly.
+// bool, so SO_RCVTIMEO/SO_SNDTIMEO are set through os::setsockopt directly. That
+// puts the platform ABI split on us: POSIX takes a `timeval`, Winsock a single
+// DWORD of milliseconds with optlen 4, and handing Winsock a timeval just fails
+// (WSAEFAULT), so the arming below branches at compile time. That branch does not
+// make Windows whole: Winsock reports an expired SO_RCVTIMEO as WSAETIMEDOUT
+// rather than EWOULDBLOCK, so the READ_TIMEOUT/WRITE_TIMEOUT mapping in
+// PlainConn.read/write is still POSIX-shaped and needs its own fix.
 struct Timeval @private
 {
 	CLong tv_sec;
 	CLong tv_usec;
 }
 
-// Arm one direction of a socket. Duration is microseconds, so the seconds and
-// microseconds fields fall straight out of it.
+<*
+ Milliseconds covering `d`, rounded up. Winsock reads 0 as "block forever", so a
+ non-zero sub-millisecond budget must never collapse to it; only a non-positive
+ `d` (the caller's own "no limit") maps to 0. Computed without adding to `d`, so
+ a budget near `time::FOREVER` cannot overflow, then clamped to the DWORD range.
+*>
+fn uint duration_to_ms_ceil(Duration d) @private
+{
+	if (d <= time::DURATION_ZERO) return 0;
+	Duration ms = (d - (Duration)1) / time::MS + (Duration)1;
+	return ms >= (Duration)uint::max ? uint::max : (uint)ms;
+}
+
+// Arm one direction of a socket.
 fn void? set_fd_timeout(TcpSocket sock, CInt optname, Duration d) @private
 {
-	Timeval tv = d <= time::DURATION_ZERO ? { 0, 0 } : { (CLong)(d / time::SEC), (CLong)(d % time::SEC) };
-	if (os::setsockopt(sock.sock, os::SOL_SOCKET, optname, &tv, Timeval::size)) return SOCKOPT_FAILED~;
+	$if env::WIN32:
+		uint ms = duration_to_ms_ceil(d);
+		if (os::setsockopt(sock.sock, os::SOL_SOCKET, optname, &ms, uint::size)) return SOCKOPT_FAILED~;
+	$else
+		// Duration is microseconds, so the seconds and microseconds fields fall
+		// straight out of it.
+		Timeval tv = d <= time::DURATION_ZERO ? { 0, 0 } : { (CLong)(d / time::SEC), (CLong)(d % time::SEC) };
+		if (os::setsockopt(sock.sock, os::SOL_SOCKET, optname, &tv, Timeval::size)) return SOCKOPT_FAILED~;
+	$endif
 }
 
 <* A plain (cleartext) TCP connection. *>
