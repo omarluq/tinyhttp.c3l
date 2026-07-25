@@ -1,6 +1,7 @@
-// A reusable HTTP client: a base URL, default headers, and a connection timeout,
-// applied to every request. Client.request reuses connections through a
-// keep-alive pool; the convenience wrappers stay one-shot.
+// A reusable HTTP client: a base URL, default headers, and a per-request time
+// budget (connect / read / write / total), applied to every request.
+// Client.request reuses connections through a keep-alive pool; the convenience
+// wrappers stay one-shot.
 
 module tinyhttp;
 import std::net::url;
@@ -10,8 +11,12 @@ import std::time;
  Configuration reused across requests. `base_url` is prepended to each path,
  `default_headers` supply header defaults for every request: a per-call header
  of the same name REPLACES (overrides) a default, so defaults contribute only
- the names the per-call set does not provide. `timeout` bounds the connect
- (0 = none).
+ the names the per-call set does not provide. `timeouts` is the per-request time
+ budget threaded into every exchange: `connect` bounds a fresh dial (and, for
+ https, the handshake) and so is spent only when the client actually dials, since
+ a pooled checkout skips it; `read`/`write` each bound one socket operation and
+ `total` bounds the exchange once a connection is in hand. See `Timeouts` and
+ `DEFAULT_TIMEOUTS` for the full contract.
 *>
 struct Client
 {

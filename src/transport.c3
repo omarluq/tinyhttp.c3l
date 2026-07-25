@@ -19,15 +19,19 @@ const CInt TCP_NODELAY @private = 1;
 <*
  Per-request time budget. Zero means no limit for every field.
 
- `connect` bounds DNS, the TCP connect and, for https, the TLS handshake.
+ `connect` bounds the TCP connect and, for https, the TLS handshake. It does NOT
+ bound name resolution: `tcp::connect` calls `getaddrinfo` before the timeout
+ applies, so the DNS phase is capped only by the platform resolver config (on
+ glibc, resolv.conf `timeout`/`attempts`).
  `read` and `write` bound ONE socket operation each and reset on every successful
  one, so a stalled peer is detected without capping total transfer time.
  `total` bounds the request/response exchange only — from the first request byte
  written to the last body byte read — as an absolute deadline, so activity cannot
- reset it within one exchange. It does NOT cover DNS, the TCP connect or the TLS
- handshake: those are bounded separately by `connect`, so one dialing call can
- spend up to `connect` + `total`. A `Client` request that retries once on a stale
- pooled connection starts a fresh `total` for the second attempt. Over TLS `total`
+ reset it within one exchange. It does NOT cover name resolution, the TCP connect
+ or the TLS handshake: the latter two are bounded separately by `connect` and name
+ resolution by neither, so one dialing call can spend up to `connect` + `total`
+ plus however long the resolver takes. A `Client` request that retries once on a
+ stale pooled connection starts a fresh `total` for the second attempt. Over TLS `total`
  is enforced per socket operation, not per SSL_read/SSL_write: one SSL_read
  assembles a whole TLS record and one SSL_write drains a whole buffer, each
  issuing many recv/send calls that individually re-arm the remaining budget, so a

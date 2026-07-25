@@ -45,8 +45,9 @@ io::printfn("status: %d", resp.status);
 
 ## Reusable Client
 
-A `Client` holds a base URL, default headers, and a connect timeout, and applies
-them to every call. A per-call header of the same name overrides a default.
+A `Client` holds a base URL, default headers, and a per-request time budget
+(connect / read / write / total), and applies them to every call. A per-call
+header of the same name overrides a default.
 
 It also keeps a keep-alive connection pool, so repeated calls to the same host
 reuse one connection instead of dialing every time. The client owns those pooled
