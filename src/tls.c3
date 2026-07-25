@@ -256,6 +256,12 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Timeout
 	}
 	if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
 
+	// Hand the socket back unarmed. The connect budget bounds the handshake only, and
+	// the reader's memo starts at zero meaning "not armed", so leaving the handshake
+	// value in place would silently impose it on every read of the transfer.
+	set_fd_timeout(sock, os::SO_RCVTIMEO, time::DURATION_ZERO)!;
+	set_fd_timeout(sock, os::SO_SNDTIMEO, time::DURATION_ZERO)!;
+
 	return { .sock = sock, .ctx = ctx, .ssl = ssl, .owns_ctx = false };
 }
 
@@ -263,7 +269,8 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Timeout
  Open a TLS connection to host:port and perform the handshake (SNI = host,
  hostname verified). Builds a private `SSL_CTX` owned by the returned conn, so it
  is self-contained for one-shot use; the Client keep-alive path shares one ctx via
- `make_ctx` + `dial_tls_ctx`. `timeout` bounds the TCP connect (0 = block indefinitely).
+ `make_ctx` + `dial_tls_ctx`. `timeouts.connect` bounds the TCP connect and the
+ handshake (0 = block indefinitely); the socket is handed back unarmed.
 *>
 fn TlsConn? dial_tls(String host, int port, TlsConfig config = { }, Timeouts timeouts = DEFAULT_TIMEOUTS)
 {
