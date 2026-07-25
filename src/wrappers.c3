@@ -11,7 +11,7 @@ fn Response? request_url(
 	String url_str,
 	Header[] headers = { },
 	char[] body = { },
-	Duration timeout = time::DURATION_ZERO,
+	Timeouts timeouts = DEFAULT_TIMEOUTS,
 	Allocator allocator = tmem,
 	TlsConfig tls = { }
 )
@@ -19,57 +19,64 @@ fn Response? request_url(
 	RequestTarget rt = make_request_target(url_str)!;
 	if (rt.is_https)
 	{
-		TlsConn conn = dial_tls(rt.url.host, rt.port, tls, timeout)!;
+		TlsConn conn = dial_tls(rt.url.host, rt.port, tls, timeouts)!;
 		defer (void)conn.close();
-		return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
+		return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body, timeouts);
 	}
-	PlainConn conn = dial(rt.url.host, rt.port, timeout)!;
+	PlainConn conn = dial(rt.url.host, rt.port, timeouts)!;
 	defer (void)conn.close();
-	return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body);
+	return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body, timeouts);
 }
 
 <* Perform `GET url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? get(
 	String url,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(GET, url, headers, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(GET, url, headers, timeouts: timeouts, allocator: allocator);
 <* Perform `HEAD url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? head(
 	String url,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(HEAD, url, headers, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(HEAD, url, headers, timeouts: timeouts, allocator: allocator);
 <* Perform `DELETE url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? delete(
 	String url,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(DELETE, url, headers, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(DELETE, url, headers, timeouts: timeouts, allocator: allocator);
 <* Perform `OPTIONS url` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? options(
 	String url,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(OPTIONS, url, headers, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(OPTIONS, url, headers, timeouts: timeouts, allocator: allocator);
 <* Perform `POST url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? post(
 	String url,
 	char[] body,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(POST, url, headers, body, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(POST, url, headers, body, timeouts: timeouts, allocator: allocator);
 <* Perform `PUT url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? put(
 	String url,
 	char[] body,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(PUT, url, headers, body, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(PUT, url, headers, body, timeouts: timeouts, allocator: allocator);
 <* Perform `PATCH url` with `body` over a fresh connection. `url` must be http:// or https://. *>
 fn Response? patch(
 	String url,
 	char[] body,
 	Header[] headers = { },
-	Allocator allocator = tmem
-) => request_url(PATCH, url, headers, body, allocator: allocator);
+	Allocator allocator = tmem,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
+) => request_url(PATCH, url, headers, body, timeouts: timeouts, allocator: allocator);

@@ -28,6 +28,26 @@ fn bool Method.is_idempotent(self) => self != POST && self != PATCH;
 
 fn bool has_crlf(String s) @private => s.contains_char('\r') || s.contains_char('\n');
 
+// io::write_all loops internally and offers no hook to re-arm the socket between
+// iterations, so a slow-drip reader could let every individual write succeed while
+// the total budget drained unchecked. This loop re-arms each pass.
+fn void? write_all_deadline(Conn conn, char[] buf, Deadline* dl) @private
+{
+	usz off = 0;
+	while (off < buf.len)
+	{
+		Duration eff = dl.next(dl.write)!;
+		if (eff != dl.armed_w)
+		{
+			conn.set_write_timeout(eff)!;
+			dl.armed_w = eff;
+		}
+		sz n = conn.write(buf[off..])!;
+		if (n == 0) return io::INCOMPLETE_WRITE~;
+		off += (usz)n;
+	}
+}
+
 <*
  Serialize an HTTP/1.1 request and write it to `conn`. Host, a default
  User-Agent, and Content-Length for a body are each added only if the caller
@@ -45,6 +65,7 @@ fn void? write_request(
 	String path,
 	Header[] headers,
 	char[] body,
+	Deadline* dl,
 	bool close = true
 ) @private
 {
@@ -86,8 +107,8 @@ fn void? write_request(
 
 	req.append_string("\r\n");
 
-	io::write_all(conn, req.str_view())!;
-	if (body.len != 0) io::write_all(conn, body)!;
+	write_all_deadline(conn, (char[])req.str_view(), dl)!;
+	if (body.len != 0) write_all_deadline(conn, body, dl)!;
 }
 
 // ---- fluent builder --------------------------------------------------------
@@ -102,7 +123,7 @@ struct RequestBuilder
 	Method method;
 	String url;
 	char[] _body;
-	Duration _timeout;
+	Timeouts _timeouts;
 	TlsConfig _tls;
 	Header[MAX_HEADERS] _headers;
 	usz _count;
@@ -142,10 +163,20 @@ fn RequestBuilder* RequestBuilder.body(&self, char[] body)
 	return self;
 }
 
-<* Set the connection timeout (0 = none). Returns the builder for chaining. *>
+<* Set the connect timeout (0 = none). Returns the builder for chaining. *>
 fn RequestBuilder* RequestBuilder.timeout(&self, Duration timeout)
 {
-	self._timeout = timeout;
+	self._timeouts.connect = timeout;
+	return self;
+}
+
+<*
+ Set the full time budget: connect, per-read, per-write and total (0 = none for
+ each). Returns the builder for chaining.
+*>
+fn RequestBuilder* RequestBuilder.timeouts(&self, Timeouts timeouts)
+{
+	self._timeouts = timeouts;
 	return self;
 }
 
@@ -171,7 +202,7 @@ fn Response? RequestBuilder.send(&self, Allocator allocator = tmem)
 		self.url,
 		self._headers[:self._count],
 		self._body,
-		self._timeout,
+		self._timeouts,
 		allocator,
 		tls: self._tls
 	);

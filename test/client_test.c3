@@ -13,12 +13,18 @@ struct MockConn (Conn)
 	bool synth; // synthetic large-body mode (no real source buffer)
 	usz synth_left; // remaining synthetic bytes to serve
 	bool fail_write; // when set, every write faults MOCK_WRITE_FAILED (mid-flight write failure)
+	usz fail_read_at; // when non-zero, the Nth read faults READ_TIMEOUT (1 == the first read)
+	usz read_count; // reads issued so far
+	Duration armed_read; // last value pushed by set_read_timeout
+	Duration armed_write; // last value pushed by set_write_timeout
 }
 
 faultdef MOCK_WRITE_FAILED; // stand-in for a socket write error surfaced by io::write_all
 
 fn sz? MockConn.read(&self, char[] buf) @dynamic
 {
+	self.read_count++;
+	if (self.fail_read_at != 0 && self.read_count == self.fail_read_at) return READ_TIMEOUT~;
 	if (self.synth)
 	{
 		if (self.synth_left == 0) return 0; // EOF
@@ -50,6 +56,17 @@ fn void? MockConn.close(&self) @dynamic
 fn char? MockConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
 fn void? MockConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
 
+// Record what the reader armed, so the timeout wiring is assertable without a socket.
+fn void? MockConn.set_read_timeout(&self, Duration d) @dynamic
+{
+	self.armed_read = d;
+}
+
+fn void? MockConn.set_write_timeout(&self, Duration d) @dynamic
+{
+	self.armed_write = d;
+}
+
 fn MockConn mock(String response) @local
 {
 	MockConn m;
@@ -67,6 +84,9 @@ fn MockConn mock_synth(usz total) @local
 	m.written = dstring::new(mem);
 	return m;
 }
+
+// An unbounded deadline, for the framing tests that predate timeouts.
+fn Deadline no_deadline() => deadline({ });
 
 // ---- tests -----------------------------------------------------------------
 
@@ -255,7 +275,7 @@ fn void test_builder() @test
 	assert(b._headers[0].name == "A");
 	assert(b._headers[1].value == "2");
 	assert(b._body == "data");
-	assert(b._timeout == 3 * time::SEC);
+	assert(b._timeouts.connect == 3 * time::SEC);
 	assert(b._tls.no_verify);
 	assert(b._tls.ca_file == "/etc/ca.pem");
 
@@ -669,6 +689,14 @@ fn sz? SeqConn.write(&self, char[] buf) @dynamic
 fn void? SeqConn.close(&self) @dynamic
 {
 }
+
+fn void? SeqConn.set_read_timeout(&self, Duration d) @dynamic
+{
+}
+
+fn void? SeqConn.set_write_timeout(&self, Duration d) @dynamic
+{
+}
 fn char? SeqConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
 fn void? SeqConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
 
@@ -764,7 +792,7 @@ fn void test_read_response_reusable_content_length() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "hello");
@@ -778,7 +806,7 @@ fn void test_read_response_reusable_chunked() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "abc");
@@ -793,7 +821,7 @@ fn void test_read_response_not_reusable_connection_close() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "abc");
@@ -807,7 +835,7 @@ fn void test_read_response_not_reusable_read_to_eof() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "plain body");
@@ -826,7 +854,7 @@ fn void test_read_response_te_non_chunked_ignores_content_length() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "gzipped body"); // Content-Length ignored, read to EOF
@@ -843,7 +871,7 @@ fn void test_read_response_leftover_not_reusable() @test
 	defer m.written.free();
 
 	bool reusable;
-	Response resp = read_response(mem, &m, GET, false, &reusable)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
 	defer resp.free();
 
 	assert(resp.body == "hello"); // only the first body; trailer dropped
@@ -1020,4 +1048,126 @@ fn void test_write_fail_stale_only_when_idempotent() @test
 		assert(false, "expected fault from failed write");
 	}
 	if (catch e = post_res) assert(e == MOCK_WRITE_FAILED, "non-idempotent POST surfaces raw write fault, no retry");
+}
+// ---- Increment 5: timeouts --------------------------------------------------
+
+fn void test_timeouts_arm_the_socket() @test
+{
+	// The reader must push the per-read budget down to the Conn before reading.
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+	defer m.written.free();
+
+	Response resp = send(mem, &m, GET, "x", "/", timeouts: { .read = 5 * time::SEC, .write = 7 * time::SEC })!!;
+	defer resp.free();
+
+	assert(m.armed_read == 5 * time::SEC, "got '%d'", m.armed_read);
+	assert(m.armed_write == 7 * time::SEC, "got '%d'", m.armed_write);
+}
+
+fn void test_timeouts_zero_means_unbounded() @test
+{
+	// A zero budget must arm zero (block indefinitely), not a tiny timeout.
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+	defer m.written.free();
+
+	Response resp = send(mem, &m, GET, "x", "/")!!;
+	defer resp.free();
+
+	assert(m.armed_read == (Duration)0, "got '%d'", m.armed_read);
+}
+
+fn void test_read_timeout_surfaces() @test
+{
+	// A read that times out mid-response must surface READ_TIMEOUT, not a parse error.
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe");
+	defer m.written.free();
+	m.fail_read_at = 2; // header block arrives, then the body read times out
+
+	Response? r = send(mem, &m, GET, "x", "/", timeouts: { .read = 1 * time::SEC });
+	if (catch err = r)
+	{
+		assert(err == READ_TIMEOUT, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected READ_TIMEOUT");
+}
+
+fn void test_total_deadline_beats_per_read() @test
+{
+	// With total < read, the effective armed budget is the smaller total.
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+	defer m.written.free();
+
+	Response resp = send(mem, &m, GET, "x", "/", timeouts: { .read = 30 * time::SEC, .total = 2 * time::SEC })!!;
+	defer resp.free();
+
+	assert(m.armed_read <= 2 * time::SEC, "got '%d'", m.armed_read);
+	assert(m.armed_read > (Duration)0, "got '%d'", m.armed_read);
+}
+
+fn void test_expired_total_faults_timeout() @test
+{
+	// An already-spent total budget must fault TIMEOUT before any syscall, and must
+	// report TIMEOUT (the violated constraint) rather than READ_TIMEOUT.
+	Deadline dl = { .start = clock::now(), .total = (Duration)1 };
+	while (dl.start.to_now().to_duration() < (Duration)2)
+	{
+	}
+
+	Duration? eff = dl.next(30 * time::SEC);
+	if (catch err = eff)
+	{
+		assert(err == TIMEOUT, "got '%s'", err);
+		return;
+	}
+	assert(false, "expected TIMEOUT");
+}
+
+fn void test_read_timeout_is_not_a_stale_retry() @test
+{
+	// The bug this increment would otherwise introduce: a READ_TIMEOUT on the first
+	// read of a REUSED connection must NOT become STALE_CONNECTION, because
+	// Client.request replays that signal, silently re-sending a POST.
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+	defer m.written.free();
+	m.fail_read_at = 1; // the very first read times out
+
+	bool reusable;
+	Response? r = do_exchange(mem, &m, POST, "x", "/", { }, "{}", true, &reusable, { .read = 1 * time::SEC });
+	if (catch err = r)
+	{
+		assert(err == READ_TIMEOUT, "got '%s' (a timeout must never be laundered into a retry)", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected READ_TIMEOUT");
+}
+
+fn void test_stale_close_still_retries() @test
+{
+	// The counterpart: a genuine idle-close (EOF on the first read of a reused conn)
+	// must still produce STALE_CONNECTION so the retry-once path works.
+	MockConn m = mock("");
+	defer m.written.free();
+
+	bool reusable;
+	Response? r = do_exchange(mem, &m, GET, "x", "/", { }, { }, true, &reusable);
+	if (catch err = r)
+	{
+		assert(err == STALE_CONNECTION, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected STALE_CONNECTION");
+}
+
+fn void test_default_timeouts_follow_go() @test
+{
+	// Bound the connect, leave transfer unbounded: Go's DefaultTransport dials with
+	// 30s while http.Client.Timeout stays zero. Pinned so it cannot drift silently.
+	assert(DEFAULT_TIMEOUTS.connect == 30 * time::SEC, "got '%d'", DEFAULT_TIMEOUTS.connect);
+	assert(DEFAULT_TIMEOUTS.read == (Duration)0, "got '%d'", DEFAULT_TIMEOUTS.read);
+	assert(DEFAULT_TIMEOUTS.write == (Duration)0, "got '%d'", DEFAULT_TIMEOUTS.write);
+	assert(DEFAULT_TIMEOUTS.total == (Duration)0, "got '%d'", DEFAULT_TIMEOUTS.total);
 }

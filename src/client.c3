@@ -18,7 +18,7 @@ struct Client
 	Allocator allocator;
 	String base_url;
 	Header[] default_headers;
-	Duration timeout;
+	Timeouts timeouts;
 	TlsConfig tls; // applied to https:// requests (default: verify vs the system CA bundle)
 	ConnPool pool; // keep-alive pool of idle connections, keyed by scheme|host|port
 	SslCtx tls_ctx; // shared long-lived SSL_CTX for https dials, built lazily on first use
@@ -45,13 +45,13 @@ fn Client client(
 	Allocator allocator,
 	String base_url = "",
 	Header[] default_headers = { },
-	Duration timeout = time::DURATION_ZERO,
+	Timeouts timeouts = DEFAULT_TIMEOUTS,
 	TlsConfig tls = { }
 ) => {
 	.allocator = allocator,
 	.base_url = base_url,
 	.default_headers = default_headers,
-	.timeout = timeout,
+	.timeouts = timeouts,
 	.tls = tls,
 	.pool = { .allocator = allocator }
 };
@@ -217,7 +217,18 @@ fn Response? Client.exchange_and_settle(
 ) @private
 {
 	bool reusable;
-	Response? r = do_exchange(self.allocator, ic.conn, method, host_hdr, target, headers, body, reused, &reusable);
+	Response? r = do_exchange(
+		self.allocator,
+		ic.conn,
+		method,
+		host_hdr,
+		target,
+		headers,
+		body,
+		reused,
+		&reusable,
+		self.timeouts
+	);
 	if (catch e = r)
 	{
 		self.pool.discard(ic);
@@ -278,12 +289,12 @@ fn IdleConn? Client.dial_idle(&self, bool is_https, String host, int port) @priv
 		if (self.tls_ctx == null) self.tls_ctx = make_ctx(self.tls)!;
 		TlsConn* c = alloc::new(self.allocator, TlsConn);
 		defer catch alloc::free(self.allocator, c);
-		*c = dial_tls_ctx(self.tls_ctx, !self.tls.no_verify, host, port, self.timeout)!;
+		*c = dial_tls_ctx(self.tls_ctx, !self.tls.no_verify, host, port, self.timeouts)!;
 		return { .conn = (Conn)c, .mem = c };
 	}
 	PlainConn* c = alloc::new(self.allocator, PlainConn);
 	defer catch alloc::free(self.allocator, c);
-	*c = dial(host, port, self.timeout)!;
+	*c = dial(host, port, self.timeouts)!;
 	return { .conn = (Conn)c, .mem = c };
 }
 

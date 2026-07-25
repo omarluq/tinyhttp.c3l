@@ -13,11 +13,16 @@
 module tinyhttp;
 import httpparser;
 import std::io;
+import std::time;
 
 faultdef
 	UNSUPPORTED_SCHEME, // scheme is neither http:// nor https://
 	CONNECT_FAILED, // could not reach the peer
-	TIMEOUT, // connect timed out
+	CONNECT_TIMEOUT, // tcp connect or tls handshake exceeded Timeouts.connect
+	READ_TIMEOUT, // one read exceeded Timeouts.read
+	WRITE_TIMEOUT, // one write exceeded Timeouts.write
+	TIMEOUT, // the total request deadline (Timeouts.total) expired
+	SOCKOPT_FAILED, // could not arm a socket timeout
 	DNS_FAILED, // host name / address resolution failed
 	INVALID_HEADER, // caller header name/value contains CR or LF
 	TOO_MANY_HEADERS, // more headers supplied than MAX_HEADERS
@@ -46,19 +51,61 @@ fn Response? send(
 	String host,
 	String path,
 	Header[] headers = { },
-	char[] body = { }
+	char[] body = { },
+	Timeouts timeouts = DEFAULT_TIMEOUTS
 )
 {
-	write_request(conn, method, host, path, headers, body)!;
-	return read_response(allocator, conn, method);
+	Deadline dl = deadline(timeouts);
+	write_request(conn, method, host, path, headers, body, &dl)!;
+	return read_response(allocator, conn, method, &dl);
 }
+
+// The live time budget for one request: the per-operation timeouts plus, when
+// `total` is non-zero, an absolute deadline measured from `start`. `armed_r` and
+// `armed_w` memoize the values last pushed to the socket so a steady-state read
+// loop re-arms with no extra syscall.
+struct Deadline @private
+{
+	Clock start;
+	Duration total;
+	Duration read;
+	Duration write;
+	Duration armed_r;
+	Duration armed_w;
+}
+
+fn Deadline deadline(
+	Timeouts t
+) @private => { .start = clock::now(), .total = t.total, .read = t.read, .write = t.write };
+
+// The budget for the next operation: the per-op timeout, clamped to whatever is
+// left of the total. Faults before the syscall when the total is already spent, so
+// a read that trips the global budget reports TIMEOUT rather than READ_TIMEOUT.
+fn Duration? Deadline.next(&self, Duration per_op) @private
+{
+	if (self.total <= time::DURATION_ZERO) return per_op;
+	Duration spent = self.start.to_now().to_duration();
+	if (spent >= self.total) return TIMEOUT~;
+	Duration left = self.total - spent;
+	if (per_op <= time::DURATION_ZERO || left < per_op) return left < MIN_BUDGET ? MIN_BUDGET : left;
+	return per_op;
+}
+
+// Never arm a socket with a budget so small it rounds to "block forever".
+const Duration MIN_BUDGET @private = (Duration)1_000;
 
 // Read once into the ByteWriter's spare capacity, advance the write cursor, tally
 // the cumulative byte count and enforce MAX_RESPONSE_BYTES. Returns the byte count
 // (0 == EOF); a read fault propagates and a size-cap breach raises RESPONSE_TOO_LARGE.
 // Callers own their ensure_capacity call (site-specific) and their own n==0 reaction.
-fn sz? read_into(Conn conn, ByteWriter* w, usz* received) @private
+fn sz? read_into(Conn conn, ByteWriter* w, usz* received, Deadline* dl) @private
 {
+	Duration eff = dl.next(dl.read)!;
+	if (eff != dl.armed_r)
+	{
+		conn.set_read_timeout(eff)!;
+		dl.armed_r = eff;
+	}
 	sz n = conn.read(w.bytes[w.index..])!;
 	w.index += n;
 	*received += (usz)n;
@@ -85,7 +132,8 @@ fn BodyFrame? read_body_content_length(
 	ByteWriter* w,
 	usz consumed,
 	usz content_length,
-	usz* received
+	usz* received,
+	Deadline* dl
 ) @private
 {
 	usz have   = (usz)w.index - consumed;
@@ -97,7 +145,7 @@ fn BodyFrame? read_body_content_length(
 		// Content-Length up front on the first byte.
 		usz want = (usz)w.index + 65536;
 		w.ensure_capacity((sz)(want < target ? want : target))!;
-		sz n = read_into(conn, w, received)!; // read into the spare capacity
+		sz n = read_into(conn, w, received, dl)!; // read into the spare capacity
 		if (n == 0) return INCOMPLETE_RESPONSE~; // fewer bytes than Content-Length before EOF
 		have = (usz)w.index - consumed;
 	}
@@ -109,7 +157,7 @@ fn BodyFrame? read_body_content_length(
 // and appends decoded output right after the previously-decoded region. Recompute the
 // base slice from array_view() every pass because ensure_capacity may move the buffer;
 // the decoder only ever rewrites raw[consumed..], so header bytes stay put.
-fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* received) @private
+fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* received, Deadline* dl) @private
 {
 	httpparser::ChunkedDecoder dec = { .consume_trailer = true };
 	usz decoded                    = 0;
@@ -127,7 +175,7 @@ fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* rec
 			// again. w.index (== consumed+decoded here) must advance by the bytes read
 			// so the next array_view() exposes them as the new segment.
 			w.ensure_capacity((sz)(consumed + decoded) + 4096)!;
-			sz n = read_into(conn, w, received)!;
+			sz n = read_into(conn, w, received, dl)!;
 			if (n == 0) return INCOMPLETE_RESPONSE~; // EOF mid-chunk
 			seg = (usz)n;
 			continue;
@@ -138,12 +186,12 @@ fn BodyFrame? read_body_chunked(Conn conn, ByteWriter* w, usz consumed, usz* rec
 
 // Close-delimited body (HTTP/1.0 style): no Content-Length, not chunked. Read until EOF.
 // Never poolable (the framing boundary is the connection close itself), so leftover is 0.
-fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* received) @private
+fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* received, Deadline* dl) @private
 {
 	while (true)
 	{
 		w.ensure_capacity(w.index + 4096)!;
-		sz n = read_into(conn, w, received)!;
+		sz n = read_into(conn, w, received, dl)!;
 		if (n == 0) break;
 	}
 	return { .body_len = (usz)w.index - consumed, .leftover = 0 };
@@ -168,6 +216,7 @@ fn Response? read_response(
 	Allocator allocator,
 	Conn conn,
 	Method method,
+	Deadline* dl,
 	bool reused = false,
 	bool* reusable = null
 ) @private
@@ -218,10 +267,12 @@ fn Response? read_response(
 			// Both failure arms below observe the same unchanged w.index, so decide the
 			// stale-keep-alive guard once: an idle reused conn closed before any byte arrived.
 			bool stale = reused && interim == 0 && w.index == 0;
-			sz? nr     = read_into(conn, &w, &received);
+			sz? nr     = read_into(conn, &w, &received, dl);
 			if (catch e = nr)
 			{
-				if (stale) return STALE_CONNECTION~; // idle keep-alive conn was closed
+				// A timeout means the peer is alive, the opposite of a stale socket, so it
+				// must not become a retry signal: Client.request would replay the request.
+				if (stale && e != READ_TIMEOUT && e != TIMEOUT) return STALE_CONNECTION~;
 				return e~;
 			}
 			sz n = nr;
@@ -287,15 +338,15 @@ fn Response? read_response(
 	}
 	else if (content_length >= 0)
 	{
-		frame = read_body_content_length(conn, &w, consumed, (usz)content_length, &received)!;
+		frame = read_body_content_length(conn, &w, consumed, (usz)content_length, &received, dl)!;
 	}
 	else if (is_chunked)
 	{
-		frame = read_body_chunked(conn, &w, consumed, &received)!;
+		frame = read_body_chunked(conn, &w, consumed, &received, dl)!;
 	}
 	else
 	{
-		frame = read_body_to_eof(conn, &w, consumed, &received)!;
+		frame = read_body_to_eof(conn, &w, consumed, &received, dl)!;
 	}
 	usz body_len = frame.body_len;
 	usz leftover = frame.leftover;
@@ -366,13 +417,17 @@ fn Response? do_exchange(
 	Header[] headers,
 	char[] body,
 	bool reused,
-	bool* reusable
+	bool* reusable,
+	Timeouts timeouts = DEFAULT_TIMEOUTS
 ) @private
 {
-	if (catch e = write_request(conn, method, host, path, headers, body, close: false))
+	Deadline dl = deadline(timeouts);
+	if (catch e = write_request(conn, method, host, path, headers, body, &dl, close: false))
 	{
 		// Only auto-retry idempotent methods: a partial write of a POST/PATCH may have
 		// reached a server that already started processing, so resending could double it.
+		// A timeout is excluded for the same reason as on the read side: the peer is alive.
+		if (e == WRITE_TIMEOUT || e == TIMEOUT) return e~;
 		return reused && method.is_idempotent() ? STALE_CONNECTION~ : e~;
 	}
 	bool resp_reusable = false;
@@ -380,6 +435,7 @@ fn Response? do_exchange(
 		allocator,
 		conn,
 		method,
+		&dl,
 		reused,
 		&resp_reusable
 	)!; // STALE_CONNECTION propagates when reused && the first read failed

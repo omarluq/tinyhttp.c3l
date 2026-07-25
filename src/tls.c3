@@ -25,6 +25,8 @@ const CInt SSL_VERIFY_NONE @private              = 0x00;
 const CInt SSL_VERIFY_PEER @private              = 0x01;
 const CInt SSL_CTRL_SET_TLSEXT_HOSTNAME @private = 55;
 const CLong TLSEXT_NAMETYPE_HOST_NAME @private   = 0;
+const CInt SSL_ERROR_WANT_READ @private          = 2;
+const CInt SSL_ERROR_WANT_WRITE @private         = 3;
 const CInt SSL_ERROR_SYSCALL @private            = 5;
 const CInt SSL_ERROR_ZERO_RETURN @private        = 6;
 const CLong X509_V_OK @private                   = 0;
@@ -95,6 +97,9 @@ fn sz? TlsConn.read(&self, char[] buf) @dynamic
 	// from a genuine protocol error.
 	CInt err = ssl_get_error(self.ssl, n);
 	if (err == SSL_ERROR_ZERO_RETURN) return 0; // clean close_notify
+	// On a blocking socket WANT_READ/WANT_WRITE can only mean SO_RCVTIMEO fired
+	// (SSL_read may want to write mid-renegotiation; either way it was a timeout).
+	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return READ_TIMEOUT~;
 	// SSL_ERROR_SYSCALL with n == 0 is a peer TCP close without close_notify
 	// (benign EOF); n < 0 is a genuine syscall failure and must surface.
 	if (err == SSL_ERROR_SYSCALL) return n == 0 ? 0 : TLS_FAILED~;
@@ -106,6 +111,8 @@ fn sz? TlsConn.write(&self, char[] buf) @dynamic
 	if (buf.len == 0) return 0; // SSL_write(num==0) returns <=0; match PlainConn's 0-byte contract
 	CInt n = ssl_write(self.ssl, (void*)buf.ptr, (CInt)buf.len);
 	if (n > 0) return (sz)n;
+	CInt err = ssl_get_error(self.ssl, n);
+	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return WRITE_TIMEOUT~;
 	return TLS_FAILED~;
 }
 
@@ -127,6 +134,10 @@ fn void? TlsConn.close(&self) @dynamic
 	}
 	return self.sock.close();
 }
+
+// SO_RCVTIMEO/SO_SNDTIMEO sit below TLS, so the plain helper arms a TLS socket too.
+fn void? TlsConn.set_read_timeout(&self, Duration d) @dynamic => set_fd_timeout(self.sock, os::SO_RCVTIMEO, d);
+fn void? TlsConn.set_write_timeout(&self, Duration d) @dynamic => set_fd_timeout(self.sock, os::SO_SNDTIMEO, d);
 
 // ---- dial ------------------------------------------------------------------
 
@@ -195,18 +206,13 @@ fn String? ip_literal(String host) @private
  handshake (SNI = host, hostname verified when `verify`). The SNI/hostname checks
  are per-SSL, so the ctx is safely shared. The returned TlsConn does NOT own `ctx`
  (owns_ctx = false): the caller keeps `ctx` alive for the connection's lifetime and
- frees it after every SSL over it is gone. `timeout` bounds the TCP connect.
+ frees it after every SSL over it is gone. `timeouts.connect` bounds the TCP
+ connect and the TLS handshake.
 *>
-fn TlsConn? dial_tls_ctx(
-	SslCtx ctx,
-	bool verify,
-	String host,
-	int port,
-	Duration timeout = time::DURATION_ZERO
-) @private
+fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Timeouts timeouts = DEFAULT_TIMEOUTS) @private
 {
 	// Reuse the plain dial for the TCP connect (timeout, TCP_NODELAY, fault map).
-	PlainConn pc   = dial(host, port, timeout)!;
+	PlainConn pc   = dial(host, port, timeouts)!;
 	TcpSocket sock = pc.sock;
 	defer catch (void)sock.close();
 
@@ -238,7 +244,16 @@ fn TlsConn? dial_tls_ctx(
 		if (verify && ssl_set1_host(ssl, host_z) != 1) return TLS_HANDSHAKE_FAILED~; // hostname check
 	}
 
-	if (ssl_connect(ssl) != 1) return TLS_HANDSHAKE_FAILED~;
+	// Bound the handshake with the same mechanism: without this a peer that accepts
+	// TCP and never speaks TLS hangs ssl_connect forever, even with a connect timeout.
+	set_fd_timeout(sock, os::SO_RCVTIMEO, timeouts.connect)!;
+	set_fd_timeout(sock, os::SO_SNDTIMEO, timeouts.connect)!;
+	if (ssl_connect(ssl) != 1)
+	{
+		CInt herr = ssl_get_error(ssl, 0);
+		if (herr == SSL_ERROR_WANT_READ || herr == SSL_ERROR_WANT_WRITE) return CONNECT_TIMEOUT~;
+		return TLS_HANDSHAKE_FAILED~;
+	}
 	if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;
 
 	return { .sock = sock, .ctx = ctx, .ssl = ssl, .owns_ctx = false };
@@ -250,12 +265,12 @@ fn TlsConn? dial_tls_ctx(
  is self-contained for one-shot use; the Client keep-alive path shares one ctx via
  `make_ctx` + `dial_tls_ctx`. `timeout` bounds the TCP connect (0 = block indefinitely).
 *>
-fn TlsConn? dial_tls(String host, int port, TlsConfig config = { }, Duration timeout = time::DURATION_ZERO)
+fn TlsConn? dial_tls(String host, int port, TlsConfig config = { }, Timeouts timeouts = DEFAULT_TIMEOUTS)
 {
 	SslCtx ctx = make_ctx(config)!;
 	defer catch ssl_ctx_free(ctx);
 
-	TlsConn tc = dial_tls_ctx(ctx, !config.no_verify, host, port, timeout)!;
+	TlsConn tc = dial_tls_ctx(ctx, !config.no_verify, host, port, timeouts)!;
 	tc.owns_ctx = true;
 	return tc;
 }

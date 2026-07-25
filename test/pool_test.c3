@@ -13,6 +13,7 @@
 module tinyhttp;
 import std::io;
 import std::os::env;
+import std::time;
 
 // A Conn that serves response bytes chunk-by-chunk, counts read/close calls, and
 // records everything written. Heap-friendly so the pool tests can own one behind
@@ -54,6 +55,14 @@ fn void? CountConn.close(&self) @dynamic
 	self.closes++;
 }
 
+fn void? CountConn.set_read_timeout(&self, Duration d) @dynamic
+{
+}
+
+fn void? CountConn.set_write_timeout(&self, Duration d) @dynamic
+{
+}
+
 // Forward read_byte/write_byte to satisfy Conn : InStream, OutStream (mirror MockConn).
 fn char? CountConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
 fn void? CountConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
@@ -85,7 +94,7 @@ fn void test_reader_precise_content_length() @test
 	CountConn m = stack_conn(chunks[..]);
 	defer m.written.free();
 
-	Response resp = read_response(mem, &m, GET)!!;
+	Response resp = read_response(mem, &m, GET, &&no_deadline())!!;
 	defer resp.free();
 
 	assert(resp.body == "hello");
@@ -105,11 +114,11 @@ fn void test_reader_reuse_two_responses() @test
 	CountConn m = stack_conn(chunks[..]);
 	defer m.written.free();
 
-	Response r1 = read_response(mem, &m, GET)!!; // reused:false
+	Response r1 = read_response(mem, &m, GET, &&no_deadline())!!; // reused:false
 	assert(r1.body == "hello");
 	r1.free();
 
-	Response r2 = read_response(mem, &m, GET)!!; // reused:false, SAME conn
+	Response r2 = read_response(mem, &m, GET, &&no_deadline())!!; // reused:false, SAME conn
 	assert(r2.body == "abc");
 	r2.free();
 }
