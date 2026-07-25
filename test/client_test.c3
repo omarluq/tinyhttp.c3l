@@ -1,6 +1,7 @@
 // Tests for the HTTP client core, driven by an in-process mock Conn (no network).
 module tinyhttp;
 import std::io;
+import std::net;
 import std::net::url;
 import std::time;
 
@@ -14,6 +15,7 @@ struct MockConn (Conn)
 	usz synth_left; // remaining synthetic bytes to serve
 	bool fail_write; // when set, every write faults MOCK_WRITE_FAILED (mid-flight write failure)
 	usz fail_read_at; // when non-zero, the Nth read faults READ_TIMEOUT (1 == the first read)
+	bool reset_read; // when set, every read faults net::CONNECTION_RESET (the peer sent RST)
 	usz read_count; // reads issued so far
 	Duration armed_read; // last value pushed by set_read_timeout
 	Duration armed_write; // last value pushed by set_write_timeout
@@ -25,6 +27,9 @@ fn sz? MockConn.read(&self, char[] buf) @dynamic
 {
 	self.read_count++;
 	if (self.fail_read_at != 0 && self.read_count == self.fail_read_at) return READ_TIMEOUT~;
+	// The fault a real socket read raises on ECONNRESET (std/net/os/posix.c3 maps it),
+	// so the policy under test is driven by the transport's own fault, not a private one.
+	if (self.reset_read) return net::CONNECTION_RESET~;
 	if (self.synth)
 	{
 		if (self.synth_left == 0) return 0; // EOF
@@ -1048,6 +1053,47 @@ fn void test_write_fail_stale_only_when_idempotent() @test
 		assert(false, "expected fault from failed write");
 	}
 	if (catch e = post_res) assert(e == MOCK_WRITE_FAILED, "non-idempotent POST surfaces raw write fault, no retry");
+}
+
+// A peer reset on the first read of a REUSED conn must not be laundered into
+// STALE_CONNECTION for a non-idempotent method: the request bytes are already on the
+// wire and an RST discards whatever the peer had queued, so the POST may well have been
+// processed. Client.request replays that signal, so laundering it double-submits.
+fn void test_reset_on_reused_conn_is_not_a_post_retry() @test
+{
+	MockConn m = mock("");
+	m.reset_read = true;
+	defer m.written.free();
+
+	bool reusable;
+	Response? r = do_exchange(mem, &m, POST, "x", "/", { }, "{}", true, &reusable);
+	if (catch err = r)
+	{
+		assert(err != STALE_CONNECTION, "a peer reset replayed a non-idempotent POST");
+		assert(err == net::CONNECTION_RESET, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected the peer reset to surface");
+}
+
+// The counterpart, so the gate above is not over-applied: the same reset on an
+// idempotent GET is still a retryable stale-connection signal.
+fn void test_reset_on_reused_conn_still_retries_get() @test
+{
+	MockConn m = mock("");
+	m.reset_read = true;
+	defer m.written.free();
+
+	bool reusable;
+	Response? r = do_exchange(mem, &m, GET, "x", "/", { }, { }, true, &reusable);
+	if (catch err = r)
+	{
+		assert(err == STALE_CONNECTION, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected STALE_CONNECTION");
 }
 // ---- Increment 5: timeouts --------------------------------------------------
 

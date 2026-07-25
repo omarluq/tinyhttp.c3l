@@ -272,16 +272,22 @@ fn Response? read_response(
 			if (catch e = nr)
 			{
 				// Only evidence that the socket is DEAD may become a retry signal, because
-				// Client.request replays that signal and the request may be non-idempotent.
-				// A reset proves the peer never answered; a timeout proves the opposite (it
-				// is alive and still working), and an unrecognised fault proves nothing, so
-				// both propagate. An allowlist keeps an unknown fault on the safe side.
-				if (stale && e == net::CONNECTION_RESET) return STALE_CONNECTION~;
+				// Client.request replays that signal. A timeout proves the opposite (the peer
+				// is alive and still working) and an unrecognised fault proves nothing, so
+				// both propagate; an allowlist keeps an unknown fault on the safe side.
+				// A reset says the peer aborted, but an abort also discards whatever it had
+				// queued to send, so unlike the orderly close below it does NOT prove the
+				// request went unprocessed. Replay it only for a method whose repeat is
+				// harmless, mirroring the write-side gate in do_exchange.
+				if (stale && method.is_idempotent() && e == net::CONNECTION_RESET) return STALE_CONNECTION~;
 				return e~;
 			}
 			sz n = nr;
 			if (n == 0)
 			{
+				// An orderly close with not one response byte: the peer finished its shutdown
+				// without answering, which is the idle keep-alive race and proves the request
+				// was never served, so this arm needs no method gate.
 				if (stale) return STALE_CONNECTION~;
 				return MALFORMED_RESPONSE~; // EOF before a complete header block
 			}
