@@ -432,6 +432,72 @@ fn void test_duplicate_identical_content_length_ok() @test
 	assert(resp.body == "hello");
 }
 
+// Content-Length is 1*DIGIT (RFC 7230 §3.3.2). A general integer parse would
+// switch base on an "0x"/"0b"/"0o" prefix, so "0x10" would frame a 16-byte body
+// while every compliant peer on the path rejects the message or reads a
+// different length — a framing desync. It must fault MALFORMED_RESPONSE.
+fn void test_hex_prefixed_content_length_rejected() @test
+{
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 0x10\r\n\r\n0123456789abcdefsmuggled");
+	defer m.written.free();
+
+	Response? r = send(mem, &m, GET, "x", "/");
+	if (catch err = r)
+	{
+		assert(err == MALFORMED_RESPONSE);
+		return;
+	}
+	r.free();
+	assert(false, "0x-prefixed Content-Length should fault MALFORMED_RESPONSE");
+}
+
+// Same rule, sign form: "+5" is not 1*DIGIT even though a general parse reads 5.
+fn void test_signed_content_length_rejected() @test
+{
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello");
+	defer m.written.free();
+
+	Response? r = send(mem, &m, GET, "x", "/");
+	if (catch err = r)
+	{
+		assert(err == MALFORMED_RESPONSE);
+		return;
+	}
+	r.free();
+	assert(false, "'+'-prefixed Content-Length should fault MALFORMED_RESPONSE");
+}
+
+// Same rule, empty form: a Content-Length line with no field-value is malformed.
+fn void test_empty_content_length_rejected() @test
+{
+	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhello");
+	defer m.written.free();
+
+	Response? r = send(mem, &m, GET, "x", "/");
+	if (catch err = r)
+	{
+		assert(err == MALFORMED_RESPONSE);
+		return;
+	}
+	r.free();
+	assert(false, "empty Content-Length should fault MALFORMED_RESPONSE");
+}
+
+// Defence in depth on content_length_header itself: the header parser strips OWS
+// around a field-value, but the framing rule must not depend on that — blanks
+// inside the value are not digits, so the value is malformed on its own terms.
+fn void test_content_length_value_with_blanks_rejected() @test
+{
+	Header[1] hs = { { (char[])"Content-Length", (char[])" 5 " } };
+	long? len    = content_length_header(hs[..]);
+	if (catch err = len)
+	{
+		assert(err == MALFORMED_RESPONSE);
+		return;
+	}
+	assert(false, "blank-padded Content-Length value should fault MALFORMED_RESPONSE");
+}
+
 // #7: a Transfer-Encoding list (last token "chunked") still de-chunks the body.
 fn void test_transfer_encoding_list_chunked() @test
 {

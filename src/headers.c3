@@ -34,8 +34,11 @@ fn bool has_header(Header[] headers, String name) @private => find_header_ref(he
 // unrecoverable. Scan every Content-Length line, parse each value, and fault
 // MALFORMED_RESPONSE if any value is unparseable or a later value differs from
 // the first (identical duplicates are allowed). Returns the agreed length, or
-// -1 when no Content-Length header is present. A single comma-list value fails
-// to_ulong() and is therefore rejected here too.
+// -1 when no Content-Length header is present. "Unparseable" is the strict
+// RFC 7230 §3.3.2 rule Content-Length = 1*DIGIT, enforced by an explicit digit
+// scan: that is what rejects an empty value, a comma list, a "+" sign, embedded
+// blanks and the 0x/0b/0o bases that to_ulong() would otherwise reinterpret
+// into an attacker-chosen frame length.
 fn long? content_length_header(Header[] headers) @private
 {
 	bool seen   = false;
@@ -43,7 +46,11 @@ fn long? content_length_header(Header[] headers) @private
 	foreach (&h : headers)
 	{
 		if (!ci_eq(h.name, "Content-Length")) continue;
-		ulong v = ((String)h.value).to_ulong() ?? MALFORMED_RESPONSE~!;
+		char[] raw = h.value;
+		if (raw.len == 0) return MALFORMED_RESPONSE~;
+		foreach (c : raw) if (c < '0' || c > '9') return MALFORMED_RESPONSE~;
+		// The conversion still rejects a digit run that overflows ulong.
+		ulong v = ((String)raw).to_ulong() ?? MALFORMED_RESPONSE~!;
 		if (seen)
 		{
 			if (v != value) return MALFORMED_RESPONSE~;
