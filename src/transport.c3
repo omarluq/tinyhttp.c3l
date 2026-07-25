@@ -57,10 +57,18 @@ const Timeouts DEFAULT_TIMEOUTS = { .connect = (Duration)30_000_000 };
 <*
  A blocking byte transport built on the stdlib stream interfaces:
  `read`/`write` move bytes (0 from `read` == peer closed) or fault;
- `close` releases the underlying resource. The timeout setters arm the stream
- until changed again (0 = block indefinitely); they live here because the timeout
- is a property of the byte stream, and because SO_RCVTIMEO sits below TLS, so one
- implementation serves both plain and TLS connections.
+ `close` releases the underlying resource. The timeout setters live here because
+ the timeout is a property of the byte stream, and because SO_RCVTIMEO sits below
+ TLS, so one implementation serves both plain and TLS connections.
+
+ Those setters are sticky, with SO_RCVTIMEO/SO_SNDTIMEO semantics: the armed value
+ bounds EVERY subsequent operation in that direction until it is set again, and its
+ clock restarts on each operation rather than accumulating across them
+ (0 = block indefinitely). An implementation MUST NOT clear the value after one
+ operation: the reader and the writer re-arm only when the effective budget
+ changes, so a per-call value would leave every operation after the first
+ unbounded. The armed value also outlives a single exchange — a connection returned
+ to the keep-alive pool carries it into the next request.
 
  An implementation MUST report an expired timeout as `READ_TIMEOUT` /
  `WRITE_TIMEOUT` rather than an underlying stream fault: the reader distinguishes
