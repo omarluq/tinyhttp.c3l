@@ -887,6 +887,23 @@ fn void test_read_response_reusable_content_length() @test
 	assert(reusable);
 }
 
+// K6b: a 101 Switching Protocols is bodiless and carries no `close` token, so the
+// generic framing rules would call it reusable — but the socket has left HTTP/1.1
+// for the upgraded protocol, so it must never go back to the keep-alive pool.
+fn void test_read_response_101_not_reusable() @test
+{
+	MockConn m = mock("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+	defer m.written.free();
+
+	bool reusable = true;
+	Response resp = read_response(mem, &m, GET, &&no_deadline(), false, &reusable)!!;
+	defer resp.free();
+
+	assert(resp.status == 101);
+	assert(resp.body.len == 0);
+	assert(!reusable);
+}
+
 // K7: a chunked response over HTTP/1.1 is framed precisely and marked reusable.
 fn void test_read_response_reusable_chunked() @test
 {

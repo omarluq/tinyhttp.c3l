@@ -235,7 +235,11 @@ fn BodyFrame? read_body_to_eof(Conn conn, ByteWriter* w, usz consumed, usz* rece
  sees a closed/empty socket the response never started, so STALE_CONNECTION is raised
  and the caller can retry once on a fresh connection. When `reusable` is non-null it
  receives whether this connection may return to the pool — the body was precisely
- delimited, neither side asked to close, and no trailing bytes remain.
+ delimited, neither side asked to close, no trailing bytes remain, and the status was
+ not 101. A 101 Switching Protocols is still returned as an ordinary bodiless Response,
+ but the socket has left HTTP/1.1 for the negotiated protocol; the current Client API
+ hands the caller no handle on that stream, so the connection is simply discarded
+ rather than poisoning the keep-alive pool.
 *>
 fn Response? read_response(
 	Allocator allocator,
@@ -420,7 +424,12 @@ fn Response? read_response(
 		bool resp_keepalive = has_connection_token(presp2.headers, "keep-alive");
 		bool delimited      = bodiless || content_length >= 0 || is_chunked;
 		bool persistent     = presp2.minor_version >= 1 ? !resp_close : resp_keepalive;
-		*reusable = delimited && persistent && leftover == 0;
+		// 101 hands the socket to another protocol: it IS precisely delimited (a 1xx
+		// carries no body), but the bytes that follow are no longer an HTTP/1.1 message
+		// stream, so it can never re-enter a keep-alive pool no matter what its
+		// Connection tokens say.
+		bool switched       = presp2.status == 101;
+		*reusable = delimited && persistent && leftover == 0 && !switched;
 	}
 
 	return {
