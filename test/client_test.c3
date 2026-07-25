@@ -14,11 +14,13 @@ struct MockConn (Conn)
 	bool synth; // synthetic large-body mode (no real source buffer)
 	usz synth_left; // remaining synthetic bytes to serve
 	bool fail_write; // when set, every write faults MOCK_WRITE_FAILED (mid-flight write failure)
-	usz fail_read_at; // when non-zero, the Nth read faults READ_TIMEOUT (1 == the first read)
+	usz fail_read_at; // when non-zero, the Nth read faults READ_TIMEOUT (1 == the first read), the fault the Conn contract requires of a timed-out transport (pinned for a real socket by test_plain_conn_maps_expired_timeout)
 	bool reset_read; // when set, every read faults net::CONNECTION_RESET (the peer sent RST)
 	usz read_count; // reads issued so far
 	Duration armed_read; // last value pushed by set_read_timeout
 	Duration armed_write; // last value pushed by set_write_timeout
+	usz arm_reads; // set_read_timeout call count (distinguishes "armed zero" from "never armed")
+	usz arm_writes; // set_write_timeout call count
 }
 
 faultdef MOCK_WRITE_FAILED; // stand-in for a socket write error surfaced by io::write_all
@@ -65,11 +67,13 @@ fn void? MockConn.write_byte(&self, char c) @dynamic => io::write_byte_using_wri
 fn void? MockConn.set_read_timeout(&self, Duration d) @dynamic
 {
 	self.armed_read = d;
+	self.arm_reads++;
 }
 
 fn void? MockConn.set_write_timeout(&self, Duration d) @dynamic
 {
 	self.armed_write = d;
+	self.arm_writes++;
 }
 
 fn MockConn mock(String response) @local
@@ -1172,20 +1176,29 @@ fn void test_timeouts_arm_the_socket() @test
 	Response resp = send(mem, &m, GET, "x", "/", timeouts: { .read = 5 * time::SEC, .write = 7 * time::SEC })!!;
 	defer resp.free();
 
+	assert(m.arm_reads > 0, "the read budget was never pushed to the socket");
+	assert(m.arm_writes > 0, "the write budget was never pushed to the socket");
 	assert(m.armed_read == 5 * time::SEC, "got '%d'", m.armed_read);
 	assert(m.armed_write == 7 * time::SEC, "got '%d'", m.armed_write);
 }
 
 fn void test_timeouts_zero_means_unbounded() @test
 {
-	// A zero budget must arm zero (block indefinitely), not a tiny timeout.
+	// A zero budget must leave the socket unbounded, never a tiny timeout. The mock is
+	// pre-armed with a 30s sentinel and counts its setter calls, so this can no longer
+	// pass merely because the recording fields are zero-initialised: an unbounded
+	// budget must issue no arming call at all (dial and the TLS handshake hand the
+	// socket back unarmed), and certainly must never push a non-zero one.
 	MockConn m = mock("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 	defer m.written.free();
+	m.armed_read = 30 * time::SEC;
+	m.armed_write = 30 * time::SEC;
 
 	Response resp = send(mem, &m, GET, "x", "/")!!;
 	defer resp.free();
 
-	assert(m.armed_read == (Duration)0, "got '%d'", m.armed_read);
+	assert(m.arm_reads == 0, "unbounded read armed '%d' in %d call(s)", m.armed_read, m.arm_reads);
+	assert(m.arm_writes == 0, "unbounded write armed '%d' in %d call(s)", m.armed_write, m.arm_writes);
 }
 
 fn void test_read_timeout_surfaces() @test
@@ -1331,4 +1344,71 @@ fn void test_transport_timeout_is_not_a_stale_retry() @test
 	}
 	r.free();
 	assert(false, "expected a timeout fault");
+}
+
+// A Conn that cannot be armed: setsockopt failing is what SOCKOPT_FAILED reports.
+struct ArmFailConn (Conn)
+{
+	DString written;
+}
+
+fn sz? ArmFailConn.read(&self, char[] buf) @dynamic => 0; // unreachable: arming fails first
+fn sz? ArmFailConn.write(&self, char[] buf) @dynamic
+{
+	self.written.append_bytes(buf);
+	return (sz)buf.len;
+}
+
+fn void? ArmFailConn.close(&self) @dynamic
+{
+}
+fn char? ArmFailConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
+fn void? ArmFailConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
+
+fn void? ArmFailConn.set_read_timeout(&self, Duration d) @dynamic => SOCKOPT_FAILED~;
+fn void? ArmFailConn.set_write_timeout(&self, Duration d) @dynamic => SOCKOPT_FAILED~;
+
+fn void test_arming_failure_is_not_a_stale_retry() @test
+{
+	// Failing to arm the socket is a local error, not evidence the peer hung up, so it
+	// must surface as SOCKOPT_FAILED even on a REUSED connection: laundering it into
+	// STALE_CONNECTION would make Client.request replay this POST. The non-zero read
+	// budget matters — with an unbounded one the setter is never reached at all.
+	ArmFailConn c;
+	c.written = dstring::new(mem);
+	defer c.written.free();
+
+	bool reusable;
+	Response? r = do_exchange(mem, &c, POST, "x", "/", { }, "{}", true, &reusable, { .read = 1 * time::SEC });
+	if (catch err = r)
+	{
+		assert(err == SOCKOPT_FAILED, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected SOCKOPT_FAILED");
+}
+
+fn void test_plain_conn_maps_expired_timeout() @test
+{
+	// The transport's own fault vocabulary, on a real socket rather than by fiat: the
+	// peer end of a connected pair never writes, so the armed SO_RCVTIMEO is the only
+	// thing that can end this read. The kernel reports EAGAIN, which the stdlib
+	// surfaces as io::WOULD_BLOCK; PlainConn must rename it READ_TIMEOUT, because the
+	// reader treats an unrecognised fault on a reused conn as "not a timeout".
+	TcpSocketPair pair;
+	pair.init()!!;
+	defer (void)pair.destroy();
+
+	PlainConn conn = { .sock = pair.recv };
+	conn.set_read_timeout(20 * time::MS)!!;
+
+	char[64] buf;
+	sz? n = conn.read(&buf);
+	if (catch err = n)
+	{
+		assert(err == READ_TIMEOUT, "got '%s'", err);
+		return;
+	}
+	assert(false, "expected READ_TIMEOUT, read %d byte(s)", (int)n);
 }
