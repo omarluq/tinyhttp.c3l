@@ -142,9 +142,10 @@ struct RequestBuilder
  Begin a `method` request to `url` (must be http:// or https://). Returns an
  UNSENT RequestBuilder: chain `.header()` / `.body()` / `.timeout()` / `.tls()`,
  then call `.send()` to execute — unlike `Client.request` / `request_url`, no
- I/O happens here.
+ I/O happens here. The time budget starts at DEFAULT_TIMEOUTS, matching every
+ other entry point; `.timeout()` / `.timeouts()` adjust it.
 *>
-fn RequestBuilder request(Method method, String url) => { .method = method, .url = url };
+fn RequestBuilder request(Method method, String url) => { .method = method, .url = url, ._timeouts = DEFAULT_TIMEOUTS };
 
 <*
  Append a header. Returns the builder for chaining. Beyond MAX_HEADERS the
@@ -171,7 +172,10 @@ fn RequestBuilder* RequestBuilder.body(&self, char[] body)
 	return self;
 }
 
-<* Set the connect timeout (0 = none). Returns the builder for chaining. *>
+<*
+ Override just the connect field of the budget, leaving the other three as they
+ stand (0 = block indefinitely). Returns the builder for chaining.
+*>
 fn RequestBuilder* RequestBuilder.timeout(&self, Duration timeout)
 {
 	self._timeouts.connect = timeout;
@@ -179,8 +183,12 @@ fn RequestBuilder* RequestBuilder.timeout(&self, Duration timeout)
 }
 
 <*
- Set the full time budget: connect, per-read, per-write and total (0 = none for
- each). Returns the builder for chaining.
+ REPLACE the whole time budget — connect, per-read, per-write and total (0 =
+ none for each) — dropping the builder's DEFAULT_TIMEOUTS starting point, so a
+ partial literal such as `{ .read = 5 * time::SEC }` also drops the connect
+ default (see the same caveat on DEFAULT_TIMEOUTS). That is also why
+ `.timeout(d).timeouts(t)` and `.timeouts(t).timeout(d)` differ. Returns the
+ builder for chaining.
 *>
 fn RequestBuilder* RequestBuilder.timeouts(&self, Timeouts timeouts)
 {

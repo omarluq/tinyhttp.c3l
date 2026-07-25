@@ -291,6 +291,19 @@ fn void test_builder() @test
 	// Default builder keeps verification on (TlsConfig{}).
 	RequestBuilder d = request(GET, "https://x/y");
 	assert(!d._tls.no_verify);
+	// ...and starts from DEFAULT_TIMEOUTS, not an all-zero budget (a zero
+	// connect would block indefinitely against a black-holed host).
+	assert(d._timeouts.connect == DEFAULT_TIMEOUTS.connect, "got '%d'", d._timeouts.connect);
+	assert(d._timeouts.read == DEFAULT_TIMEOUTS.read, "got '%d'", d._timeouts.read);
+	assert(d._timeouts.write == DEFAULT_TIMEOUTS.write, "got '%d'", d._timeouts.write);
+	assert(d._timeouts.total == DEFAULT_TIMEOUTS.total, "got '%d'", d._timeouts.total);
+
+	// .timeouts() REPLACES the whole budget: a partial literal drops the
+	// connect default rather than merging into it.
+	RequestBuilder p = request(GET, "https://x/y");
+	p.timeouts({ .read = 5 * time::SEC });
+	assert(p._timeouts.connect == (Duration)0, "got '%d'", p._timeouts.connect);
+	assert(p._timeouts.read == 5 * time::SEC);
 }
 
 // ---- regression tests ------------------------------------------------------
