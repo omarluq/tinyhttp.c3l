@@ -42,7 +42,15 @@ fn void? write_all_deadline(Conn conn, char[] buf, Deadline* dl) @private
 			conn.set_write_timeout(eff)!;
 			dl.armed_w = eff;
 		}
-		sz n = conn.write(buf[off..])!;
+		sz? nw = conn.write(buf[off..]);
+		if (catch e = nw)
+		{
+			// Mirror of read_into: the socket was possibly armed from the remaining
+			// total, so a fired write timeout may really be the total budget expiring.
+			if (e == WRITE_TIMEOUT && dl.total_spent()) return TIMEOUT~;
+			return e~;
+		}
+		sz n = nw;
 		if (n == 0) return io::INCOMPLETE_WRITE~;
 		off += (usz)n;
 	}

@@ -1249,6 +1249,118 @@ fn void test_expired_total_faults_timeout() @test
 	assert(false, "expected TIMEOUT");
 }
 
+// A Conn that fails the way a real socket armed from the remaining TOTAL budget
+// fails: it serves whatever bytes it holds, then the next operation blocks for the
+// whole armed duration before reporting the per-operation fault the Conn contract
+// requires (SO_RCVTIMEO/SO_SNDTIMEO cannot know WHICH budget armed them). Deciding
+// that the request deadline is what really expired is the reader's job, not the
+// transport's, so the fault under test is never the one stubbed in here.
+struct StallConn (Conn)
+{
+	char[] to_read;
+	usz read_pos;
+	bool stall_write;
+	Duration armed_read;
+	Duration armed_write;
+}
+
+// Burn `d` of wall clock, as a socket blocked on its armed budget would.
+macro StallConn.burn(&self, Duration d)
+{
+	Clock t0 = clock::now();
+	while (t0.to_now().to_duration() < d)
+	{
+	}
+}
+
+fn sz? StallConn.read(&self, char[] buf) @dynamic
+{
+	usz avail = self.to_read.len - self.read_pos;
+	if (avail == 0)
+	{
+		self.burn(self.armed_read);
+		return READ_TIMEOUT~;
+	}
+	usz n = avail < buf.len ? avail : buf.len;
+	buf[:n] = self.to_read[self.read_pos:n];
+	self.read_pos += n;
+	return (sz)n;
+}
+
+fn sz? StallConn.write(&self, char[] buf) @dynamic
+{
+	if (!self.stall_write) return (sz)buf.len;
+	self.burn(self.armed_write);
+	return WRITE_TIMEOUT~;
+}
+
+fn void? StallConn.close(&self) @dynamic
+{
+}
+fn char? StallConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
+fn void? StallConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
+
+fn void? StallConn.set_read_timeout(&self, Duration d) @dynamic
+{
+	self.armed_read = d;
+}
+
+fn void? StallConn.set_write_timeout(&self, Duration d) @dynamic
+{
+	self.armed_write = d;
+}
+
+fn void test_total_tripped_by_read_reports_timeout() @test
+{
+	// With only `total` set, EVERY read is armed from the remaining total, so the
+	// interesting expiry happens inside the syscall rather than before it. The
+	// constraint violated is the request deadline, not a per-read budget the caller
+	// never set, so the fault must be TIMEOUT — otherwise READ_TIMEOUT makes the two
+	// indistinguishable and Deadline.next's TIMEOUT arm is unreachable in practice.
+	StallConn c = { .to_read = (char[])"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe" };
+
+	Response? r = send(mem, &c, GET, "x", "/", timeouts: { .total = 20 * time::MS });
+	if (catch err = r)
+	{
+		assert(err == TIMEOUT, "got '%s' (the total budget expired, not a per-read one)", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected TIMEOUT");
+}
+
+fn void test_total_tripped_by_write_reports_timeout() @test
+{
+	// The write-side mirror: a write armed from the remaining total reports
+	// WRITE_TIMEOUT when it fires, and must be reclassified the same way.
+	StallConn c = { .stall_write = true };
+
+	Response? r = send(mem, &c, GET, "x", "/", timeouts: { .total = 20 * time::MS });
+	if (catch err = r)
+	{
+		assert(err == TIMEOUT, "got '%s' (the total budget expired, not a per-write one)", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected TIMEOUT");
+}
+
+fn void test_per_read_timeout_keeps_its_own_fault() @test
+{
+	// The counterpart guard: with no total budget there is nothing to reclassify to,
+	// so a per-read expiry must keep reporting READ_TIMEOUT.
+	StallConn c = { .to_read = (char[])"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe" };
+
+	Response? r = send(mem, &c, GET, "x", "/", timeouts: { .read = 20 * time::MS });
+	if (catch err = r)
+	{
+		assert(err == READ_TIMEOUT, "got '%s'", err);
+		return;
+	}
+	r.free();
+	assert(false, "expected READ_TIMEOUT");
+}
+
 fn void test_read_timeout_is_not_a_stale_retry() @test
 {
 	// The bug this increment would otherwise introduce: a READ_TIMEOUT on the first

@@ -80,8 +80,10 @@ fn Deadline deadline(
 ) @private => { .start = clock::now(), .total = t.total, .read = t.read, .write = t.write };
 
 // The budget for the next operation: the per-op timeout, clamped to whatever is
-// left of the total. Faults before the syscall when the total is already spent, so
-// a read that trips the global budget reports TIMEOUT rather than READ_TIMEOUT.
+// left of the total. Faults TIMEOUT only when the total is already spent at arm
+// time; when some remains the socket is armed with `left`, so the total can just
+// as well be tripped DURING the syscall — that case reports the transport's
+// per-op fault and is reclassified by the call site (see Deadline.total_spent).
 fn Duration? Deadline.next(&self, Duration per_op) @private
 {
 	if (self.total <= time::DURATION_ZERO) return per_op;
@@ -90,6 +92,20 @@ fn Duration? Deadline.next(&self, Duration per_op) @private
 	Duration left = self.total - spent;
 	if (per_op <= time::DURATION_ZERO || left < per_op) return left < MIN_BUDGET ? MIN_BUDGET : left;
 	return per_op;
+}
+
+// Whether the total budget is exhausted as of now. A socket armed from the
+// REMAINING TOTAL rather than from the per-op timeout still reports READ_TIMEOUT /
+// WRITE_TIMEOUT when it fires, but the constraint actually violated is `total`; the
+// operation call sites use this to relabel that fault TIMEOUT, so a caller that set
+// only `total` can tell "the request ran out of wall clock" from "this one operation
+// was too slow". Always false when no total is set, so a purely per-op budget is
+// never relabelled. The MIN_BUDGET floor cannot fool it: spending at least the floor
+// past an already-tiny remainder still leaves spent >= total.
+fn bool Deadline.total_spent(&self) @private
+{
+	if (self.total <= time::DURATION_ZERO) return false;
+	return self.start.to_now().to_duration() >= self.total;
 }
 
 // Never arm a socket with a budget so small it rounds to "block forever".
@@ -107,7 +123,15 @@ fn sz? read_into(Conn conn, ByteWriter* w, usz* received, Deadline* dl) @private
 		conn.set_read_timeout(eff)!;
 		dl.armed_r = eff;
 	}
-	sz n = conn.read(w.bytes[w.index..])!;
+	sz? nr = conn.read(w.bytes[w.index..]);
+	if (catch e = nr)
+	{
+		// The socket was possibly armed from the remaining total rather than from
+		// dl.read, so a fired read timeout may really be the total budget expiring.
+		if (e == READ_TIMEOUT && dl.total_spent()) return TIMEOUT~;
+		return e~;
+	}
+	sz n = nr;
 	w.index += n;
 	*received += (usz)n;
 	if (*received > MAX_RESPONSE_BYTES) return RESPONSE_TOO_LARGE~;
