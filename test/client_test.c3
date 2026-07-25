@@ -1171,3 +1171,52 @@ fn void test_default_timeouts_follow_go() @test
 	assert(DEFAULT_TIMEOUTS.write == (Duration)0, "got '%d'", DEFAULT_TIMEOUTS.write);
 	assert(DEFAULT_TIMEOUTS.total == (Duration)0, "got '%d'", DEFAULT_TIMEOUTS.total);
 }
+// A Conn that fails the way a real PlainConn fails when SO_RCVTIMEO expires: the
+// stdlib maps EWOULDBLOCK to io::WOULD_BLOCK (std/net/os/posix.c3), so this is the
+// fault the transport actually produces, not one stubbed in by fiat.
+struct WouldBlockConn (Conn)
+{
+	DString written;
+}
+
+fn sz? WouldBlockConn.read(&self, char[] buf) @dynamic => io::WOULD_BLOCK~;
+
+fn sz? WouldBlockConn.write(&self, char[] buf) @dynamic
+{
+	self.written.append_bytes(buf);
+	return (sz)buf.len;
+}
+
+fn void? WouldBlockConn.close(&self) @dynamic
+{
+}
+fn char? WouldBlockConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
+fn void? WouldBlockConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
+
+fn void? WouldBlockConn.set_read_timeout(&self, Duration d) @dynamic
+{
+}
+
+fn void? WouldBlockConn.set_write_timeout(&self, Duration d) @dynamic
+{
+}
+
+fn void test_transport_timeout_is_not_a_stale_retry() @test
+{
+	// A POST on a REUSED pooled connection whose first read times out must not be
+	// laundered into STALE_CONNECTION, which Client.request replays. This drives the
+	// fault the real transport raises, so it fails if the PlainConn mapping is lost.
+	WouldBlockConn c;
+	c.written = dstring::new(mem);
+	defer c.written.free();
+
+	bool reusable;
+	Response? r = do_exchange(mem, &c, POST, "x", "/", { }, "{}", true, &reusable, { .read = 1 * time::SEC });
+	if (catch err = r)
+	{
+		assert(err != STALE_CONNECTION, "a transport timeout was laundered into a replayable stale-connection signal");
+		return;
+	}
+	r.free();
+	assert(false, "expected a timeout fault");
+}

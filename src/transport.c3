@@ -47,10 +47,16 @@ const Timeouts DEFAULT_TIMEOUTS = { .connect = (Duration)30_000_000 };
 <*
  A blocking byte transport built on the stdlib stream interfaces:
  `read`/`write` move bytes (0 from `read` == peer closed) or fault;
- `close` releases the underlying resource. The timeout setters bound a single
- subsequent operation (0 = block indefinitely); they live here because the
- timeout is a property of the byte stream, and because SO_RCVTIMEO sits below
- TLS, so one implementation serves both plain and TLS connections.
+ `close` releases the underlying resource. The timeout setters arm the stream
+ until changed again (0 = block indefinitely); they live here because the timeout
+ is a property of the byte stream, and because SO_RCVTIMEO sits below TLS, so one
+ implementation serves both plain and TLS connections.
+
+ An implementation MUST report an expired timeout as `READ_TIMEOUT` /
+ `WRITE_TIMEOUT` rather than an underlying stream fault: the reader distinguishes
+ a timeout (the peer is alive) from a closed idle keep-alive socket (safe to
+ retry) purely by that fault, and mislabelling one as the other replays the
+ request.
 *>
 interface Conn : InStream, OutStream
 {
@@ -81,10 +87,27 @@ struct PlainConn (Conn)
 	TcpSocket sock;
 }
 
-fn sz? PlainConn.read(&self, char[] buf) @dynamic => self.sock.read(buf);
-fn sz? PlainConn.write(&self, char[] buf) @dynamic => self.sock.write(buf);
-fn char? PlainConn.read_byte(&self) @dynamic => self.sock.read_byte();
-fn void? PlainConn.write_byte(&self, char c) @dynamic => self.sock.write_byte(c);
+// The socket is always blocking, so EWOULDBLOCK (which the stdlib surfaces as
+// io::WOULD_BLOCK) can only mean the armed SO_RCVTIMEO/SO_SNDTIMEO fired. Naming
+// it here is what lets the reader tell a timeout from a dead keep-alive socket:
+// left unmapped it is mistaken for a stale connection and the request is replayed.
+fn sz? PlainConn.read(&self, char[] buf) @dynamic
+{
+	sz? n = self.sock.read(buf);
+	if (catch e = n) return e == io::WOULD_BLOCK ? READ_TIMEOUT~ : e~;
+	return n;
+}
+
+fn sz? PlainConn.write(&self, char[] buf) @dynamic
+{
+	sz? n = self.sock.write(buf);
+	if (catch e = n) return e == io::WOULD_BLOCK ? WRITE_TIMEOUT~ : e~;
+	return n;
+}
+
+// Route the byte helpers through the mapped methods above, not around them.
+fn char? PlainConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
+fn void? PlainConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
 fn void? PlainConn.close(&self) @dynamic => self.sock.close();
 fn void? PlainConn.set_read_timeout(&self, Duration d) @dynamic => set_fd_timeout(self.sock, os::SO_RCVTIMEO, d);
 fn void? PlainConn.set_write_timeout(&self, Duration d) @dynamic => set_fd_timeout(self.sock, os::SO_SNDTIMEO, d);

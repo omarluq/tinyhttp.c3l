@@ -13,6 +13,7 @@
 module tinyhttp;
 import httpparser;
 import std::io;
+import std::net;
 import std::time;
 
 faultdef
@@ -270,9 +271,12 @@ fn Response? read_response(
 			sz? nr     = read_into(conn, &w, &received, dl);
 			if (catch e = nr)
 			{
-				// A timeout means the peer is alive, the opposite of a stale socket, so it
-				// must not become a retry signal: Client.request would replay the request.
-				if (stale && e != READ_TIMEOUT && e != TIMEOUT) return STALE_CONNECTION~;
+				// Only evidence that the socket is DEAD may become a retry signal, because
+				// Client.request replays that signal and the request may be non-idempotent.
+				// A reset proves the peer never answered; a timeout proves the opposite (it
+				// is alive and still working), and an unrecognised fault proves nothing, so
+				// both propagate. An allowlist keeps an unknown fault on the safe side.
+				if (stale && e == net::CONNECTION_RESET) return STALE_CONNECTION~;
 				return e~;
 			}
 			sz n = nr;
