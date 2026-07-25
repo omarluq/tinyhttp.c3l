@@ -27,7 +27,12 @@ const CInt TCP_NODELAY @private = 1;
  reset it within one exchange. It does NOT cover DNS, the TCP connect or the TLS
  handshake: those are bounded separately by `connect`, so one dialing call can
  spend up to `connect` + `total`. A `Client` request that retries once on a stale
- pooled connection starts a fresh `total` for the second attempt.
+ pooled connection starts a fresh `total` for the second attempt. Over TLS `total`
+ is enforced per socket operation, not per SSL_read/SSL_write: one SSL_read
+ assembles a whole TLS record and one SSL_write drains a whole buffer, each
+ issuing many recv/send calls that individually re-arm the remaining budget, so a
+ peer that dribbles bytes can overshoot `total`. Set `read`/`write` alongside
+ `total` to bound such a peer.
 *>
 struct Timeouts
 {
