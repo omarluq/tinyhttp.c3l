@@ -17,15 +17,25 @@ fn Response? request_url(
 )
 {
 	RequestTarget rt = make_request_target(url_str)!;
+	// Both concrete conns are declared up front so the one we bind outlives the
+	// call; the unused sibling stays zero-initialized and is never touched. The
+	// defer is registered only after `conn` is bound, so a dial fault rethrows
+	// without closing anything.
+	TlsConn tls_conn;
+	PlainConn plain_conn;
+	Conn conn;
 	if (rt.is_https)
 	{
-		TlsConn conn = dial_tls(rt.url.host, rt.port, tls, timeouts)!;
-		defer (void)conn.close();
-		return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body, timeouts);
+		tls_conn = dial_tls(rt.url.host, rt.port, tls, timeouts)!;
+		conn = &tls_conn;
 	}
-	PlainConn conn = dial(rt.url.host, rt.port, timeouts)!;
+	else
+	{
+		plain_conn = dial(rt.url.host, rt.port, timeouts)!;
+		conn = &plain_conn;
+	}
 	defer (void)conn.close();
-	return send(allocator, &conn, method, rt.host_hdr, rt.target, headers, body, timeouts);
+	return send(allocator, conn, method, rt.host_hdr, rt.target, headers, body, timeouts);
 }
 
 <* Perform `GET url` over a fresh connection. `url` must be http:// or https://. *>
