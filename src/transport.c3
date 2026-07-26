@@ -101,6 +101,16 @@ struct Timeval @private
 	CLong tv_usec;
 }
 
+// Transport faults live next to the code that raises them. CONNECT_TIMEOUT is
+// also raised by tls.c3, which already depends on this file for dial,
+// set_fd_timeout, Conn and Timeouts, so declaring it here keeps that dependency
+// pointing one way.
+faultdef
+	CONNECT_FAILED, // could not reach the peer
+	CONNECT_TIMEOUT, // tcp connect or tls handshake exceeded Timeouts.connect
+	DNS_FAILED, // host name / address resolution failed
+	SOCKOPT_FAILED; // could not arm a socket timeout
+
 <*
  Milliseconds covering `d`, rounded up. Winsock reads 0 as "block forever", so a
  non-zero sub-millisecond budget must never collapse to it; only a non-positive

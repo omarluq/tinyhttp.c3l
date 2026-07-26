@@ -16,15 +16,12 @@ import std::io;
 import std::net;
 import std::time;
 
+// Transport faults are declared in transport.c3; TLS faults in tls.c3.
 faultdef
 	UNSUPPORTED_SCHEME, // scheme is neither http:// nor https://
-	CONNECT_FAILED, // could not reach the peer
-	CONNECT_TIMEOUT, // tcp connect or tls handshake exceeded Timeouts.connect
 	READ_TIMEOUT, // one read exceeded Timeouts.read
 	WRITE_TIMEOUT, // one write exceeded Timeouts.write
 	TIMEOUT, // the total request deadline (Timeouts.total) expired
-	SOCKOPT_FAILED, // could not arm a socket timeout
-	DNS_FAILED, // host name / address resolution failed
 	INVALID_HEADER, // caller header name/value contains CR or LF
 	TOO_MANY_HEADERS, // more headers supplied than MAX_HEADERS
 	RESPONSE_TOO_LARGE, // response exceeded MAX_RESPONSE_BYTES
