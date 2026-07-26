@@ -31,6 +31,10 @@ const CInt SSL_ERROR_SYSCALL @private            = 5;
 const CInt SSL_ERROR_ZERO_RETURN @private        = 6;
 const CLong X509_V_OK @private                   = 0;
 
+// Bound on the close_notify write in `TlsConn.close`; see there for why teardown
+// carries its own budget instead of inheriting the request's `Timeouts`.
+const Duration SHUTDOWN_TIMEOUT @private = (Duration)5_000_000;
+
 extern fn SslMethod tls_client_method() @cname("TLS_client_method") @private;
 extern fn SslCtx ssl_ctx_new(SslMethod method) @cname("SSL_CTX_new") @private;
 extern fn void ssl_ctx_free(SslCtx ctx) @cname("SSL_CTX_free") @private;
@@ -124,10 +128,21 @@ fn sz? TlsConn.write(&self, char[] buf) @dynamic
 fn char? TlsConn.read_byte(&self) @dynamic => io::read_byte_using_read(self);
 fn void? TlsConn.write_byte(&self, char c) @dynamic => io::write_byte_using_write(self, c);
 
+<*
+ Tear the connection down: send close_notify, free the SSL (and the ctx when this
+ conn owns it), then close the socket. The close_notify write is bounded by a
+ fixed short budget (`SHUTDOWN_TIMEOUT`) independent of the request's `Timeouts`,
+ so closing a wedged peer cannot block indefinitely.
+*>
 fn void? TlsConn.close(&self) @dynamic
 {
 	if (self.ssl != null)
 	{
+		// Teardown must not inherit whatever SO_SNDTIMEO the request loop left armed
+		// (or none at all, which is what dial hands back): SSL_shutdown writes
+		// close_notify, a blocking socket write that a peer with a closed receive
+		// window stalls forever. Best-effort, so the arming fault is dropped.
+		(void)set_fd_timeout(self.sock, os::SO_SNDTIMEO, SHUTDOWN_TIMEOUT);
 		ssl_shutdown(self.ssl);
 		ssl_free(self.ssl);
 		self.ssl = (Ssl)null;

@@ -121,6 +121,65 @@ fn void test_read_timeout_survives_dirty_error_queue() @test
 	assert(false, "expected READ_TIMEOUT, read %d byte(s)", (int)n);
 }
 
+// Teardown writes close_notify on a blocking socket, so TlsConn.close must arm its
+// own send bound: dial hands the socket back unarmed and a plain-defaults request
+// never arms SO_SNDTIMEO, so without it a peer that stopped reading wedges close()
+// — on every teardown path, including the pool discarding an already-sick conn.
+// The arming is observed through a dup of the socket: dup shares one file
+// description, and therefore one SO_SNDTIMEO, with the fd close() armed and closed.
+extern fn CInt dup_fd(CInt fd) @cname("dup") @if(!env::WIN32) @private;
+
+fn void test_close_bounds_close_notify() @test
+{
+	$if !env::WIN32: // dup(2) and the timeval readback are POSIX; the arming is not
+		TcpSocketPair pair;
+		pair.init()!!;
+		defer (void)pair.destroy();
+
+		SslCtx cctx = make_ctx({ .no_verify = true })!!;
+		defer free_shared_ctx(cctx);
+		anon_ctx(cctx);
+
+		SslCtx sctx = ssl_ctx_new(tls_server_method());
+		assert(sctx != null);
+		defer free_shared_ctx(sctx);
+		anon_ctx(sctx);
+
+		Ssl client = ssl_new(cctx);
+		Ssl server = ssl_new(sctx);
+		assert(client != null && server != null);
+		defer ssl_free(server); // `client` is freed by tc.close() below
+
+		CInt fd = dup_fd((CInt)pair.send.sock);
+		assert(fd >= 0);
+		assert(ssl_set_fd(client, fd) == 1);
+		assert(ssl_set_fd(server, (CInt)pair.recv.sock) == 1);
+		Socket dup_sock = { .sock = (NativeSocket)fd };
+		set_fd_timeout((TcpSocket)dup_sock, os::SO_RCVTIMEO, 30 * time::MS)!!;
+		set_fd_timeout(pair.recv, os::SO_RCVTIMEO, 30 * time::MS)!!;
+
+		bool up, down;
+		for (int i = 0; i < 40 && !(up && down); i++)
+		{
+			if (!up) up = ssl_connect(client) == 1;
+			if (!down) down = ssl_accept(server) == 1;
+		}
+		assert(up && down, "anonymous handshake did not complete");
+
+		// Unarmed for sending, exactly as dial_tls_ctx leaves a handed-back socket.
+		set_fd_timeout((TcpSocket)dup_sock, os::SO_SNDTIMEO, time::DURATION_ZERO)!!;
+
+		TlsConn tc = { .sock = (TcpSocket)dup_sock, .ctx = cctx, .ssl = client };
+		tc.close()!!;
+
+		Timeval tv;
+		os::Socklen_t len = Timeval::size;
+		assert(os::getsockopt(pair.send.sock, os::SOL_SOCKET, os::SO_SNDTIMEO, &tv, &len) == 0);
+		Duration armed = (Duration)tv.tv_sec * time::SEC + (Duration)tv.tv_usec;
+		assert(armed == SHUTDOWN_TIMEOUT, "close left the close_notify write bounded at %s", armed);
+	$endif
+}
+
 // Live end-to-end HTTPS round-trip: real handshake + certificate verification vs
 // the system trust store, then a decrypted 200 response. Gated on TINYHTTP_LIVE
 // (needs a network), so the default `compile-test` stays offline.
