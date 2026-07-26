@@ -31,6 +31,11 @@ const CInt SSL_ERROR_SYSCALL @private            = 5;
 const CInt SSL_ERROR_ZERO_RETURN @private        = 6;
 const CLong X509_V_OK @private                   = 0;
 
+// On a blocking socket WANT_READ/WANT_WRITE can only mean SO_RCVTIMEO/SO_SNDTIMEO
+// fired (an SSL_read may want to write mid-renegotiation and vice versa; either way
+// it was a timeout). Each call site maps that to its own timeout fault.
+fn bool ssl_want_io(CInt err) @private => err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
+
 // Bound on the close_notify write in `TlsConn.close`; see there for why teardown
 // carries its own budget instead of inheriting the request's `Timeouts`.
 const Duration SHUTDOWN_TIMEOUT @private = (Duration)5_000_000;
@@ -114,9 +119,7 @@ fn sz? TlsConn.read(&self, char[] buf) @dynamic
 	// which is what the READ_TIMEOUT and benign-EOF arms below depend on.
 	CInt err = ssl_get_error(self.ssl, n);
 	if (err == SSL_ERROR_ZERO_RETURN) return 0; // clean close_notify
-	// On a blocking socket WANT_READ/WANT_WRITE can only mean SO_RCVTIMEO fired
-	// (SSL_read may want to write mid-renegotiation; either way it was a timeout).
-	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return READ_TIMEOUT~;
+	if (ssl_want_io(err)) return READ_TIMEOUT~;
 	// SSL_ERROR_SYSCALL with n == 0 is a peer TCP close without close_notify
 	// (benign EOF); n < 0 is a genuine syscall failure and must surface.
 	if (err == SSL_ERROR_SYSCALL) return n == 0 ? 0 : TLS_FAILED~;
@@ -130,7 +133,10 @@ fn sz? TlsConn.write(&self, char[] buf) @dynamic
 	CInt n = ssl_write(self.ssl, (void*)buf.ptr, ssl_chunk_len(buf.len));
 	if (n > 0) return (sz)n;
 	CInt err = ssl_get_error(self.ssl, n);
-	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return WRITE_TIMEOUT~;
+	if (ssl_want_io(err)) return WRITE_TIMEOUT~;
+	// No ZERO_RETURN/SYSCALL arms to mirror read's: n == 0 out of SSL_write means
+	// "no progress", not a clean EOF, and write_all_deadline maps that to
+	// INCOMPLETE_WRITE — reporting it as a successful 0-byte write would hide it.
 	return TLS_FAILED~;
 }
 
@@ -281,10 +287,14 @@ fn TlsConn? dial_tls_ctx(SslCtx ctx, bool verify, String host, int port, Timeout
 	// call above returns on its own failure — their queue entries are never fed to
 	// an ssl_get_error, and only this handshake's are.
 	err_clear_error();
-	if (ssl_connect(ssl) != 1)
+	CInt rc = ssl_connect(ssl);
+	if (rc != 1)
 	{
-		CInt herr = ssl_get_error(ssl, 0);
-		if (herr == SSL_ERROR_WANT_READ || herr == SSL_ERROR_WANT_WRITE) return CONNECT_TIMEOUT~;
+		// SSL_get_error branches on the exact return of the call that failed, so
+		// forward `rc` rather than a literal: 0 keeps the ZERO_RETURN classification
+		// available, < 0 is the retry/syscall case.
+		CInt herr = ssl_get_error(ssl, rc);
+		if (ssl_want_io(herr)) return CONNECT_TIMEOUT~;
 		return TLS_HANDSHAKE_FAILED~;
 	}
 	if (verify && ssl_get_verify_result(ssl) != X509_V_OK) return TLS_HANDSHAKE_FAILED~;

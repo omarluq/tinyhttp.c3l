@@ -55,6 +55,19 @@ fn void test_ssl_chunk_len_clamps() @test
 	assert(ssl_chunk_len((usz)CInt::max * 2 + 2) == CInt::max); // bare cast: 0
 }
 
+// The want-I/O predicate is shared by read, write and the handshake, each mapping it
+// to its own timeout fault, so it must cover exactly WANT_READ and WANT_WRITE: a
+// false positive would report a protocol failure as a timeout, and a false negative
+// would turn an SO_RCVTIMEO/SO_SNDTIMEO expiry into TLS_FAILED.
+fn void test_ssl_want_io() @test
+{
+	assert(ssl_want_io(SSL_ERROR_WANT_READ));
+	assert(ssl_want_io(SSL_ERROR_WANT_WRITE));
+	assert(!ssl_want_io(SSL_ERROR_ZERO_RETURN));
+	assert(!ssl_want_io(SSL_ERROR_SYSCALL));
+	assert(!ssl_want_io(0)); // SSL_ERROR_NONE
+}
+
 // A TLS session both ends of which live in this process, over a socketpair: no
 // network, no certificate. Anonymous-DH (ADH) at security level 0 is what removes
 // the certificate — it is a test-only cipher and nothing but this file selects it.
