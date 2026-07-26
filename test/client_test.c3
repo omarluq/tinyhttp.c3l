@@ -1301,10 +1301,8 @@ fn void test_expired_total_faults_timeout() @test
 {
 	// An already-spent total budget must fault TIMEOUT before any syscall, and must
 	// report TIMEOUT (the violated constraint) rather than READ_TIMEOUT.
-	Deadline dl = { .start = clock::now(), .total = (Duration)1 };
-	while (dl.start.to_now().to_duration() < (Duration)2)
-	{
-	}
+	// Clock ticks are nanoseconds, so this start is 1ms in the past against a 1us total.
+	Deadline dl = { .start = (Clock)((ulong)clock::now() - 1_000_000), .total = (Duration)1 };
 
 	Duration? eff = dl.next(30 * time::SEC);
 	if (catch err = eff)
