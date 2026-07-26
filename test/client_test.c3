@@ -21,6 +21,7 @@ struct MockConn (Conn)
 	Duration armed_write; // last value pushed by set_write_timeout
 	usz arm_reads; // set_read_timeout call count (distinguishes "armed zero" from "never armed")
 	usz arm_writes; // set_write_timeout call count
+	usz writes; // write() call count (one syscall / one TLS record each)
 }
 
 faultdef MOCK_WRITE_FAILED; // stand-in for a socket write error surfaced by io::write_all
@@ -51,6 +52,7 @@ fn sz? MockConn.read(&self, char[] buf) @dynamic
 fn sz? MockConn.write(&self, char[] buf) @dynamic
 {
 	if (self.fail_write) return MOCK_WRITE_FAILED~;
+	self.writes++;
 	self.written.append_bytes(buf);
 	return (sz)buf.len;
 }
@@ -238,6 +240,40 @@ fn void test_send_post_body() @test
 	assert(req.contains("Content-Type: application/json\r\n"));
 	assert(req.contains("Content-Length: 2\r\n")); // auto-added for the body
 	assert(req.contains("\r\n\r\n{}")); // blank line then body
+	assert(m.writes == 1); // head and small body coalesce into one write
+}
+
+// A small body rides along in the head buffer: one write syscall, and over TLS
+// one record instead of two. The wire bytes are unchanged either way.
+fn void test_send_small_body_single_write() @test
+{
+	MockConn m = mock("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+	defer m.written.free();
+
+	char[COALESCE_BODY_MAX] body;
+	body[..] = 'b';
+	Response resp = send(mem, &m, PUT, "api.x", "/blob", body: body[..])!!;
+	defer resp.free();
+
+	assert(m.writes == 1);
+	assert(m.written.str_view().ends_with((String)body[..]));
+}
+
+// One byte past the threshold the copy would outweigh the saved syscall, so the
+// body keeps its own write.
+fn void test_send_large_body_separate_write() @test
+{
+	MockConn m = mock("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+	defer m.written.free();
+
+	char[] body = mem::new_array(char, COALESCE_BODY_MAX + 1);
+	defer free(body.ptr);
+	body[..] = 'b';
+	Response resp = send(mem, &m, PUT, "api.x", "/blob", body: body)!!;
+	defer resp.free();
+
+	assert(m.writes == 2);
+	assert(m.written.str_view().ends_with((String)body));
 }
 
 fn void test_send_malformed() @test

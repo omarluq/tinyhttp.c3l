@@ -7,6 +7,10 @@ import std::io;
 const String USER_AGENT @private = "tinyhttp/0.1";
 const usz MAX_HEADERS @private   = 32; // capacity of the builder / merged-header arrays
 
+// Bodies at or below this size are copied into the head buffer so the request
+// leaves as a single write; see write_request.
+const usz COALESCE_BODY_MAX @private = 8 * 1024;
+
 <* Each method carries its on-the-wire name (e.g. GET.name == "GET"). *>
 enum Method : char (String name)
 {
@@ -110,8 +114,14 @@ fn void? write_request(
 
 	req.append_string("\r\n");
 
+	// A separate body write costs an extra syscall and — with Nagle disabled in dial() —
+	// an extra segment; over TLS an extra SSL_write, i.e. a whole extra record with its
+	// own header and AEAD tag. Small bodies are cheaper to memcpy into the head buffer.
+	// Large ones keep the two-write path, where the copy would outweigh the saved write.
+	bool coalesce = body.len != 0 && body.len <= COALESCE_BODY_MAX;
+	if (coalesce) req.append_bytes(body);
 	write_all_deadline(conn, (char[])req.str_view(), dl)!;
-	if (body.len != 0) write_all_deadline(conn, body, dl)!;
+	if (body.len != 0 && !coalesce) write_all_deadline(conn, body, dl)!;
 }
 
 // ---- fluent builder --------------------------------------------------------
