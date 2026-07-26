@@ -93,11 +93,20 @@ struct TlsConn (Conn)
 	bool owns_ctx;
 }
 
+<*
+ Clamp a slice length to what SSL_read/SSL_write's `num` parameter can carry.
+ A buffer past `CInt::max` would truncate to 0 or a negative num, and OpenSSL
+ would fault an otherwise valid transfer; clamping makes it a short read/write
+ instead, which both call sites already loop on. PlainConn has no equivalent
+ narrowing (libc recv/send take a usz), so this keeps the `Conn` seam uniform.
+*>
+fn CInt ssl_chunk_len(usz len) @private => len > (usz)CInt::max ? CInt::max : (CInt)len;
+
 fn sz? TlsConn.read(&self, char[] buf) @dynamic
 {
 	if (buf.len == 0) return 0; // honor the same 0-byte contract as PlainConn/recv
 	err_clear_error(); // SSL_get_error reads the thread-local queue first, so it must hold only this call's error
-	CInt n = ssl_read(self.ssl, (void*)buf.ptr, (CInt)buf.len);
+	CInt n = ssl_read(self.ssl, (void*)buf.ptr, ssl_chunk_len(buf.len));
 	if (n > 0) return (sz)n;
 	// 0 / negative: distinguish EOF (clean close, or the peer just closed TCP)
 	// from a genuine protocol error. The queue was emptied above, so what
@@ -118,7 +127,7 @@ fn sz? TlsConn.write(&self, char[] buf) @dynamic
 {
 	if (buf.len == 0) return 0; // SSL_write(num==0) returns <=0; match PlainConn's 0-byte contract
 	err_clear_error(); // as in read: SSL_get_error below must see only this call's error
-	CInt n = ssl_write(self.ssl, (void*)buf.ptr, (CInt)buf.len);
+	CInt n = ssl_write(self.ssl, (void*)buf.ptr, ssl_chunk_len(buf.len));
 	if (n > 0) return (sz)n;
 	CInt err = ssl_get_error(self.ssl, n);
 	if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return WRITE_TIMEOUT~;

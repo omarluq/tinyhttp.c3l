@@ -41,6 +41,20 @@ fn void test_zero_length_io() @test
 	assert(tc.read(empty)!! == 0);
 }
 
+// SSL_read/SSL_write take a CInt `num`, so a slice longer than CInt::max must be
+// clamped down to a short read/write rather than cast: the bare cast wraps to 0 at
+// 2^32 and goes negative at 2^31, and OpenSSL faults either as TLS_FAILED even
+// though the buffer is perfectly valid. PlainConn hands libc recv/send the full
+// usz, so without the clamp the two transports disagree on the same slice.
+fn void test_ssl_chunk_len_clamps() @test
+{
+	assert(ssl_chunk_len(0) == 0);
+	assert(ssl_chunk_len(4096) == 4096);
+	assert(ssl_chunk_len((usz)CInt::max) == CInt::max);
+	assert(ssl_chunk_len((usz)CInt::max + 1) == CInt::max); // bare cast: negative
+	assert(ssl_chunk_len((usz)CInt::max * 2 + 2) == CInt::max); // bare cast: 0
+}
+
 // A TLS session both ends of which live in this process, over a socketpair: no
 // network, no certificate. Anonymous-DH (ADH) at security level 0 is what removes
 // the certificate — it is a test-only cipher and nothing but this file selects it.
