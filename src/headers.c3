@@ -8,7 +8,9 @@ alias Header = httpparser::Header;
 
 // Case-insensitive equality. Accepts a raw char[] token (as the parser produces)
 // or a String, since String implicitly converts to char[].
-fn bool ci_eq(char[] a, String b) @private => ((String)a).compare_to_ignore_case(b) == 0;
+// The length guard is a fast reject for the common non-matching case:
+// compare_to_ignore_case only returns 0 when the lengths already match.
+fn bool ci_eq(char[] a, String b) @private => a.len == b.len && ((String)a).compare_to_ignore_case(b) == 0;
 
 // First header whose name case-insensitively matches, or null.
 fn Header* find_header_ref(Header[] headers, String name) @private
