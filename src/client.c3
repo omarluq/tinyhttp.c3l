@@ -17,6 +17,13 @@ import std::time;
  a pooled checkout skips it; `read`/`write` each bound one socket operation and
  `total` bounds the exchange once a connection is in hand. See `Timeouts` and
  `DEFAULT_TIMEOUTS` for the full contract.
+
+ The keep-alive `pool` is bounded: at most DEFAULT_MAX_IDLE_CONNS idle sockets
+ are held across all origins, so an empty-base_url client walking many distinct
+ hosts cannot accumulate one live socket per host. Once the pool is full a
+ finished connection is closed instead of parked (the incoming conn is dropped;
+ nothing already pooled is evicted), which costs a fresh dial next time but never
+ correctness. `close` still releases whatever remains pooled.
 *>
 struct Client
 {
@@ -58,7 +65,7 @@ fn Client client(
 	.default_headers = default_headers,
 	.timeouts = timeouts,
 	.tls = tls,
-	.pool = { .allocator = allocator }
+	.pool = { .allocator = allocator, .max_idle = DEFAULT_MAX_IDLE_CONNS }
 };
 
 <*

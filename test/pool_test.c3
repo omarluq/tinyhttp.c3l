@@ -301,7 +301,53 @@ fn void test_pool_free_drains() @test
 	w2.free();
 }
 
-// (12) The full stale-retry orchestration (Client.request's two branches),
+// (12) max_idle bounds the TOTAL idle set, not just one bucket: with a cap of 1,
+// a checkin under a second key discards the incoming conn instead of parking it
+// (so a client walking N origins cannot hold N sockets), and a checkout frees the
+// slot again so the next checkin is accepted. Unbounded pooling would store the
+// second conn (closes == 0) and hand it back on checkout.
+fn void test_pool_max_idle_cap() @test
+{
+	ConnPool p    = { .allocator = mem, .max_idle = 1 };
+	CountConn* c1 = heap_conn({ });
+	CountConn* c2 = heap_conn({ });
+	CountConn* c3 = heap_conn({ });
+	DString w1    = c1.written; // saved: discard frees the struct, not this buffer
+	DString w2    = c2.written;
+	DString w3    = c3.written;
+
+	p.checkin("http|a|80", { .conn = (Conn)c1, .mem = c1 });
+	p.checkin("http|b|80", { .conn = (Conn)c2, .mem = c2 }); // at the cap -> discarded
+	assert(c2.closes == 1); // closed + freed on the way in, never parked
+	w2.free();
+
+	IdleConn? miss = p.checkout("http|b|80");
+	if (catch e = miss)
+	{
+		assert(e == POOL_EMPTY);
+	}
+	else
+	{
+		assert(false, "expected POOL_EMPTY: the over-cap conn must not be pooled");
+	}
+
+	// Checking A out frees the slot, so the pool accepts a conn again.
+	IdleConn got = p.checkout("http|a|80")!!;
+	p.discard(got);
+	assert(c1.closes == 1);
+	w1.free();
+
+	p.checkin("http|c|80", { .conn = (Conn)c3, .mem = c3 });
+	IdleConn back = p.checkout("http|c|80")!!;
+	assert(back.mem == c3);
+	p.checkin("http|c|80", back);
+
+	p.free(); // drain: close + free C, free buckets + copied keys
+	assert(c3.closes == 1);
+	w3.free();
+}
+
+// (13) The full stale-retry orchestration (Client.request's two branches),
 // assembled by hand with mocks: a stale pooled conn A raises STALE_CONNECTION on
 // the reused exchange and is discarded (closed once); the retry then succeeds on
 // a fresh conn B, which comes back reusable.
@@ -350,7 +396,7 @@ fn void test_stale_retry_orchestration() @test
 	bw.free();
 }
 
-// (13) Live end-to-end keep-alive: two GETs through one Client exercise a real
+// (14) Live end-to-end keep-alive: two GETs through one Client exercise a real
 // dial -> pool -> reuse, then Client.close drains the pool. Gated on
 // TINYHTTP_LIVE (needs a network), so the default compile-test stays offline.
 fn void test_keepalive_live() @test
